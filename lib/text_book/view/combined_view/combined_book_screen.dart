@@ -361,6 +361,7 @@ class _CombinedViewState extends State<CombinedView> {
   /// מאגר הפוקוס של החלון; נשמר כאן כי ב-dispose אסור לחפש ב-context.
   late final FocusRepository _focus;
 
+  final _personalNotesLineIndex = PersonalNotesLineIndex();
   PageStorageBucket _commentaryStorage = PageStorageBucket();
   bool _localCorrectionActive = false;
   bool _anchorHandledCurrentTap = false;
@@ -404,6 +405,7 @@ class _CombinedViewState extends State<CombinedView> {
   bool _disposed = false;
   final Map<int, GlobalKey> _commentaryCardKeys = {};
   int? _commentaryRevealLine;
+  int _lastLinkSelectionRequestId = 0;
   int _commentaryRevealGeneration = 0;
   bool _commentaryRevealSelectionObserved = false;
   bool _commentaryRevealAtEnd = false;
@@ -978,15 +980,27 @@ class _CombinedViewState extends State<CombinedView> {
       _clearSelectionBeforeJump();
     }
     _scrollToInitialPosition(state);
+    final selectedLine = state.selectedIndex;
+    final linkRequest = state.linkSelectionRequestId;
+    final current = _textBookBloc.state;
+    if (!widget.isPreviewMode &&
+        widget.showCommentaryAsExpansionTiles &&
+        selectedLine != null &&
+        linkRequest != 0 &&
+        linkRequest != _lastLinkSelectionRequestId &&
+        current is TextBookLoaded &&
+        current.linkSelectionRequestId == linkRequest &&
+        current.selectedIndex == selectedLine &&
+        _hasCommentaries(current, selectedLine)) {
+      _lastLinkSelectionRequestId = linkRequest;
+      _revealCommentaryCardBelow(selectedLine);
+    }
     final line = _commentaryRevealLine;
     if (line == null) return;
     if (state.selectedIndex == line && state.selectedIndices.contains(line)) {
       if (!_commentaryRevealSelectionObserved) {
         _commentaryRevealSelectionObserved = true;
-        final generation = _commentaryRevealGeneration;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          unawaited(_positionCommentaryCard(line, generation));
-        });
+        _scheduleCommentaryPosition(line);
       }
     } else if (_commentaryRevealSelectionObserved) {
       _cancelCommentaryReveal();
@@ -995,6 +1009,7 @@ class _CombinedViewState extends State<CombinedView> {
 
   void _resetBookState() {
     _cancelCommentaryReveal();
+    _lastLinkSelectionRequestId = 0;
     _cancelPendingAnchorHover();
     LinkPreviewOverlay.dismiss(window: AppWindowKeys.of(context));
     _activeAnchorLine = null;
@@ -2065,7 +2080,12 @@ class _CombinedViewState extends State<CombinedView> {
         }
         return LayoutBuilder(
           builder: (context, constraints) {
-            // שומר את גובה הבלוק בפועל לשימוש בחישובי הגלילה
+            final revealLine = _commentaryRevealLine;
+            if (constraints.maxHeight < _viewportHeight &&
+                revealLine != null &&
+                _commentaryCardAnchor?.isActive == true) {
+              _scheduleCommentaryPosition(revealLine);
+            }
             _viewportHeight = constraints.maxHeight;
 
             // יירוט Ctrl+C ממוקם *מעל* ה-SelectionArea — שם מנגנון ה-override
@@ -2341,15 +2361,16 @@ class _CombinedViewState extends State<CombinedView> {
                                               previous.locatedNotes !=
                                                   current.locatedNotes,
                                           builder: (context, notesState) {
-                                            final noteMap =
+                                            final notes =
                                                 notesState.bookId ==
                                                     personalNotesBookKey(
                                                       state.book,
                                                     )
-                                                ? indexPersonalNotesByLine(
-                                                    notesState.locatedNotes,
-                                                  )
-                                                : <int, List<PersonalNote>>{};
+                                                ? notesState.locatedNotes
+                                                : const <PersonalNote>[];
+                                            final noteMap =
+                                                _personalNotesLineIndex
+                                                    .forSnapshot(notes);
                                             return SmoothWheelScroll(
                                               child: ScrollPositionReanchor(
                                                 layoutKey: context.select(
@@ -3089,6 +3110,13 @@ class _CombinedViewState extends State<CombinedView> {
     _onTextBookState(_textBookBloc.state);
   }
 
+  void _scheduleCommentaryPosition(int line) {
+    final generation = _commentaryRevealGeneration;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_positionCommentaryCard(line, generation));
+    });
+  }
+
   Future<void> _positionCommentaryCard(int line, int generation) async {
     if (!mounted || generation != _commentaryRevealGeneration) return;
     final lines = widget.tab.lines;
@@ -3104,6 +3132,10 @@ class _CombinedViewState extends State<CombinedView> {
     final viewportBox = viewport as RenderBox;
     final top = card.localToGlobal(Offset.zero, ancestor: viewportBox).dy;
     final height = scroll.position.viewportDimension;
+    // עוגן קיים נשמר כל עוד יש לכרטיס מקום גם אחרי צמצום התצוגה.
+    if (_commentaryCardAnchor?.isActive == true && top <= height * 0.25) {
+      return;
+    }
     final tail = scroll.position.extentAfter + height - top - card.size.height;
     if (_commentaryRevealAtEnd &&
         tail <= height * 0.25 &&
@@ -3130,7 +3162,13 @@ class _CombinedViewState extends State<CombinedView> {
               ?.findRenderObject();
           if (target is! RenderBox || !target.hasSize) return null;
           final offset = target.localToGlobal(Offset.zero, ancestor: item);
-          return offset & target.size;
+          // הכרטיס (עד 75% מהמסך) יורד עד רבע המסך כדי שתחילת המקור לא תיחתך.
+          final viewportHeight = scroll.position.viewportDimension;
+          final shift = (offset.dy - viewportHeight * 0.15).clamp(
+            0.0,
+            viewportHeight * 0.1,
+          );
+          return offset.translate(0, -shift) & target.size;
         },
       ),
     );

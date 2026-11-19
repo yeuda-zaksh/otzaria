@@ -13,7 +13,7 @@ import 'dart:math';
 import 'dart:async';
 import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart' show listEquals, setEquals;
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
@@ -23,7 +23,6 @@ import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:otzaria/widgets/misc/app_selection_area.dart';
 import 'package:otzaria/widgets/misc/app_menu_exports.dart';
-import 'package:otzaria/widgets/misc/link_context_menu_entry.dart';
 import 'package:otzaria/bookmarks/bloc/bookmark_bloc.dart';
 import 'package:otzaria/core/messages/notes_messages.dart';
 import 'package:otzaria/core/messages/pdf_messages.dart';
@@ -45,6 +44,7 @@ import 'package:otzaria/pdf_book/utils/pdf_personal_note_anchor.dart';
 import 'package:otzaria/plugins/utils/plugin_context_menu_entries.dart';
 import 'package:otzaria/pdf_book/utils/pdf_scroll_physics_provider.dart';
 import 'package:otzaria/pdf_book/utils/pdf_text_selection_actions.dart';
+import 'package:otzaria/pdf_book/utils/pdf_viewport_geometry.dart';
 import 'package:otzaria/data/repository/text_book_repository.dart';
 import 'package:otzaria/book_common/view/book_source_dialog.dart';
 import 'package:otzaria/book_common/utils/default_commentators.dart';
@@ -57,7 +57,11 @@ import 'package:otzaria/pdf_book/bloc/pdf_book_event.dart' as pdf_events;
 import 'package:otzaria/pdf_book/bloc/pdf_book_state.dart';
 import 'package:otzaria/pdf_book/utils/pdf_spread_layout.dart';
 import 'package:otzaria/pdf_book/utils/pdf_render_scale.dart';
+import 'package:otzaria/pdf_book/utils/pdf_viewer_lifecycle_policy.dart';
 import 'package:otzaria/pdf_book/utils/pdf_image_budget.dart';
+import 'package:otzaria/pdf_book/utils/pdf_book_layout.dart';
+import 'package:otzaria/pdf_book/utils/pdf_context_menu_builders.dart';
+import 'package:otzaria/pdf_book/utils/pdf_rendering_policy.dart';
 import 'package:otzaria/pdf_book/utils/pdf_search_index_restorer.dart';
 import 'package:otzaria/pdf_book/utils/trackpad_axis_lock.dart';
 import 'package:otzaria/pdf_book/utils/trackpad_pan_recognizer.dart';
@@ -142,182 +146,11 @@ import 'package:otzaria/widgets/navigation/nav_side_panel.dart';
 import 'package:otzaria/theme/theme_exports.dart';
 import 'package:otzaria/widgets/navigation/app_top_bar.dart';
 
-/// תקציב מטמון התמונות של טאב PDF, המתחלק בין חלוניותיו.
-const int kPdfImageCacheBudgetBytes = 48 * 1024 * 1024;
-
-/// חלקו של צפיין בתקציב הטאב; חלוניות טקסט אינן נספרות.
-int pdfImageCacheBytesForPanes(int pdfPaneCount) =>
-    kPdfImageCacheBudgetBytes ~/ max(1, pdfPaneCount);
-
-/// מלבן הכפולה במרחב התצוגה, בלי חיתוך לגבולותיה. גאומטריית הדפדוף נשענת
-/// עליו: מרכזו הוא השדרה, וחצי מרוחבו הוא עמוד אחד.
-@visibleForTesting
-Rect pdfSpreadTurnViewportRect(Matrix4 matrix, Rect spreadRect) =>
-    MatrixUtils.transformRect(matrix, spreadRect);
-
-/// החלק הנראה של הכפולה — למסכת התצוגה ולאזורי הגרירה, שחייבים להישאר
-/// בתוך המסך. אסור להאכיל בו את גאומטריית הדפדוף: הוא מזיז את השדרה.
-@visibleForTesting
-Rect? pdfSpreadVisibleViewportRect(
-  Matrix4 matrix,
-  Rect spreadRect,
-  Size viewportSize,
-) {
-  final clippedRect = pdfSpreadTurnViewportRect(
-    matrix,
-    spreadRect,
-  ).intersect(Offset.zero & viewportSize);
-  if (clippedRect.width <= 0 || clippedRect.height <= 0) return null;
-  return clippedRect;
-}
-
-/// מרכז התצוגה שמציב את [anchorDocTop] בראשה, בזום ובגובה הנתונים.
-/// האופק נשאר כפי שחישבה מדיניות שינוי-הגודל של pdfrx.
-@visibleForTesting
-Offset pdfTopAnchoredCenter({
-  required double anchorDocTop,
-  required Offset currentCenter,
-  required Size viewSize,
-  required double zoom,
-}) => Offset(currentCenter.dx, anchorDocTop + viewSize.height / 2 / zoom);
-
-/// עוגן חד־פעמי לשימור קו הראש בעת שינוי רוחב קורא ה-PDF.
-@visibleForTesting
-class PdfPaneToggleAnchor {
-  double? _docTop;
-  Size? _viewSize;
-
-  /// מכין עוגן לשינוי רוחב אמיתי, או מנקה עוגן קודם כשהחלונית היא overlay.
-  void prepare({
-    required bool changesReaderWidth,
-    double? docTop,
-    Size? viewSize,
-  }) {
-    _docTop = null;
-    _viewSize = null;
-    if (!changesReaderWidth || docTop == null || viewSize == null) return;
-    _docTop = docTop;
-    _viewSize = viewSize;
-  }
-
-  /// צורך את העוגן פעם אחת ומחזיר אותו רק לשינוי הרוחב התואם.
-  double? consume({
-    required Size? oldViewSize,
-    required Size newViewSize,
-    required bool isBookView,
-  }) {
-    final docTop = _docTop;
-    final capturedViewSize = _viewSize;
-    _docTop = null;
-    _viewSize = null;
-    if (docTop == null ||
-        oldViewSize != capturedViewSize ||
-        isBookView ||
-        oldViewSize!.width == newViewSize.width) {
-      return null;
-    }
-    return docTop;
-  }
-}
-
-/// מחזיר את מדיניות שינוי גודל ה-PDF לפי מצב התצוגה.
-/// קנה המידה של תמונת התצוגה המקדימה לפי הזום הנוכחי; ראה [pdfPreviewRenderingScale].
-double pdfPreviewRenderingScaleFor(
-  BuildContext context,
-  PdfPage page,
-  PdfViewerController controller,
-  double estimatedScale,
-) {
-  final pageRect = controller.layout.pageLayouts[page.pageNumber - 1];
-  final displayScale = page.width > 0
-      ? controller.currentZoom *
-            MediaQuery.devicePixelRatioOf(context) *
-            pageRect.width /
-            page.width
-      : 0.0;
-  return pdfPreviewRenderingScale(
-    displayScale: displayScale,
-    threshold: estimatedScale,
-    pageWidth: page.width,
-    pageHeight: page.height,
-    // ברירת המחדל של onePassRenderingSizeThreshold ב-pdfrx.
-    sizeThreshold: 2000,
-  );
-}
-
-/// זום ההתאמה לרוחב ולעמוד שלם של [shown] — העמוד, או הכפולה בתצוגת ספר.
-@visibleForTesting
-({double width, double page}) pdfFitZooms({
-  required Rect shown,
-  required Size viewSize,
-  required double margin,
-}) {
-  final width = (viewSize.width - margin * 2) / shown.width;
-  final height = (viewSize.height - margin * 2) / shown.height;
-  return (width: width, page: min(width, height));
-}
-
-/// המתג עובר לעמוד שלם כשהתצוגה כבר מותאמת לרוחב, ולרוחב בכל מצב אחר.
-@visibleForTesting
-bool pdfNextFitIsPage({required double zoom, required double widthZoom}) =>
-    (zoom - widthZoom).abs() <= widthZoom * 0.01;
-
-/// הסמל והכיתוב של כפתור ההתאמה: הפעולה שלחיצה תבצע, והקיצור אם הוגדר
-/// (§3.2).
-@visibleForTesting
-({IconData icon, String tooltip}) pdfFitButtonVisual({
-  required bool nextIsPage,
-}) {
-  final label = nextIsPage ? 'התאם לעמוד שלם' : 'התאם לרוחב';
-  final shortcut = ShortcutValidator.getShortcutValue(
-    ShortcutValidator.fitPdfViewKey,
-  );
-  return (
-    icon: nextIsPage
-        ? FluentIcons.arrow_autofit_height_24_regular
-        : FluentIcons.arrow_autofit_width_24_regular,
-    tooltip: shortcut == null || shortcut.isEmpty
-        ? label
-        : '$label (${ShortcutHelper.formatShortcutForDisplay(shortcut)})',
-  );
-}
-
-@visibleForTesting
-PdfViewerSizeDelegateProvider pdfSizeDelegateProviderForLayoutMode(
-  PdfLayoutMode layoutMode,
-) {
-  return layoutMode.isBookView
-      ? const PdfViewerSizeDelegateProviderLegacy(maxScale: 20)
-      : const PdfViewerSizeDelegateProviderSmart(
-          maxScale: 20,
-          smartMaxScale: 20,
-          maxPagesVisible: 1,
-        );
-}
-
-/// העמוד הנוכחי: בתצוגה רגילה זה שבראש החלון, ובתצוגת ספר הכפולה שבמרכזו —
-/// כפולה נמוכה מהחלון ממורכזת בו, וראש החלון נופל אז בכפולה הקודמת.
-@visibleForTesting
-PdfViewerCalculateCurrentPageNumberFunction pdfCurrentPageCalculatorFor(
-  PdfLayoutMode layoutMode,
-) => layoutMode.isBookView
-    ? (visibleRect, pageRects, controller) => pdfTopmostVisiblePage(
-        Rect.fromLTWH(
-          visibleRect.left,
-          visibleRect.center.dy,
-          visibleRect.width,
-          0,
-        ),
-        pageRects,
-      )
-    : (visibleRect, pageRects, controller) =>
-          pdfTopmostVisiblePage(visibleRect, pageRects);
-
-/// מתחת לכפתור "נסה שוב" הצפיין נשאר פתוח, כדי שפתיחה איטית שתסתיים תגבור
-/// על השגיאה; הסרתו נוטשת את הפתיחה (#1930). ב-retry אוטומטי הוא נבנה מחדש.
-@visibleForTesting
-bool pdfViewerStaysMountedFor(PdfBookState state) =>
-    !(state is PdfBookError && state.autoRetry);
+export 'package:otzaria/pdf_book/utils/pdf_book_layout.dart';
+export 'package:otzaria/pdf_book/utils/pdf_context_menu_builders.dart';
+export 'package:otzaria/pdf_book/utils/pdf_viewer_lifecycle_policy.dart';
+export 'package:otzaria/pdf_book/utils/pdf_viewport_geometry.dart';
+export 'package:otzaria/pdf_book/utils/pdf_rendering_policy.dart';
 
 class PdfBookScreen extends StatefulWidget {
   final PdfBookTab tab;
@@ -337,315 +170,9 @@ class PdfBookScreen extends StatefulWidget {
   State<PdfBookScreen> createState() => _PdfBookScreenState();
 }
 
-/// האם יש לחשב מחדש את טווח השורות (currentTextLineNumber/End) בעקבות
-/// מעבר בין מצבי תצוגה. הטווח תלוי במצב — בתצוגת ספר הוא מכסה את שני עמודי
-/// הספירייד, וברגילה עמוד יחיד — לכן מעבר מצב מחייב חישוב מחדש, אחרת טווח
-/// המפרשים נשאר של המצב הקודם. ה-baseline (previous=null) לא מטריגר חישוב.
-@visibleForTesting
-bool shouldRecomputeLineRangeOnLayoutModeChange(
-  PdfLayoutMode? previous,
-  PdfLayoutMode current,
-) {
-  return previous != null && previous != current;
-}
-
-/// האם דפדוף חדש מבטל את הדפדופים הממתינים בתור: לחיצה בכיוון ההפוך
-/// לממתינים מרוקנת אותם, כך שהאנימציה שבאוויר מסיימת והבאה הפוכה ממנה.
-@visibleForTesting
-bool shouldDropPendingPageTurns<T>({
-  required Iterable<T> pendingDirections,
-  required T incomingDirection,
-}) {
-  return pendingDirections.any((d) => d != incomingDirection);
-}
-
-/// משך דפדוף כשממתינים [pendingTurns] נוספים בתור: 1/(n+1) מהמשך הבודד, כך
-/// שתור של לחיצות מהירות מתקצר ככל שהוא ארוך יותר.
-@visibleForTesting
-Duration pdfQueuedPageTurnDuration(Duration single, int pendingTurns) =>
-    Duration(microseconds: single.inMicroseconds ~/ (max(0, pendingTurns) + 1));
-
-/// מחזירה את מספר העמוד הנוכחי של ה-controller רק אם הוא מחובר ומוכן.
-///
-/// [isReady] - האם ה-controller מחובר ל-PdfViewer (`controller.isReady`).
-/// [readPageNumber] - קריאה ל-`controller.pageNumber`.
-///
-/// הגישה ל-`controller.pageNumber` משתמשת ב-null check operator פנימי
-/// (`_state!`), ולכן זורקת אם ה-PdfViewer התנתק במהלך `await` ב-`onViewerReady`.
-/// העטיפה הזו מוודאת שלא ניגשים ל-`pageNumber` כש-ה-controller אינו מוכן,
-/// ומחזירה `null` במקום לקרוס.
-@visibleForTesting
-int? resolveReadyPdfPageNumber({
-  required bool isReady,
-  required int? Function() readPageNumber,
-}) {
-  return isReady ? readPageNumber() : null;
-}
-
-/// ה-layout של [controller], או null אם עוד לא חושב: ב-pdfrx `isReady` נעשה
-/// true לפני חישוב ה-layout, ו-`controller.layout` זורק בחלון הזה.
-@visibleForTesting
-PdfPageLayout? pdfReadyLayoutOrNull(PdfViewerController controller) {
-  if (!controller.isReady) return null;
-  try {
-    return controller.layout;
-  } catch (_) {
-    return null;
-  }
-}
-
-/// בונה את פריט תפריט ההקשר "קישורים" עבור PDF.
-/// משתמש ב-`childrenBuilder` (טעינה עצלה) כדי שהתפריט הראשי ייפתח מיד,
-/// בלי להמתין ל-FutureBuilders של `link.displayReference` של כל קישור.
-@visibleForTesting
-AppContextMenuEntry buildPdfLinksContextMenuEntry({
-  required List<otz_links.Link> relevantLinks,
-  required bool showOpenLinksPaneEntry,
-  required VoidCallback onOpenLinksPane,
-  required void Function(otz_links.Link link) onOpenLink,
-}) {
-  List<AppContextMenuEntry> buildLinkChildren() {
-    return <AppContextMenuEntry>[
-      if (showOpenLinksPaneEntry) ...[
-        AppContextMenuEntry(
-          label: 'פתח קישורים בחלונית צד',
-          onTap: onOpenLinksPane,
-        ),
-        const AppContextMenuEntry.divider(),
-      ],
-      ...relevantLinks.map(
-        (link) => buildLinkContextMenuEntry(
-          link: link,
-          onTap: () => onOpenLink(link),
-        ),
-      ),
-    ];
-  }
-
-  return AppContextMenuEntry(
-    label: 'קישורים',
-    icon: OtzariaIcons.links_24_regular,
-    enabled: relevantLinks.isNotEmpty,
-    childrenBuilder: buildLinkChildren,
-  );
-}
-
-/// מעדכן ושומר בחירה שהשתנתה, ופותח את חלונית המפרשים בכל לחיצה.
-@visibleForTesting
-void applyPdfCommentatorSelection({
-  required Set<String> activeCommentators,
-  required Set<String> updated,
-  required VoidCallback onChanged,
-  required VoidCallback onOpenPane,
-}) {
-  if (!setEquals(activeCommentators, updated)) {
-    activeCommentators
-      ..clear()
-      ..addAll(updated);
-    onChanged();
-  }
-  onOpenPane();
-}
-
-/// מרכיב את פריטי תפריט ההקשר של עמוד ה-PDF.
-///
-/// התפריט הזה מחליף את התפריט המובנה של pdfrx — `onGeneralTap` מחזיר `true`
-/// ל-secondaryTap ול-longPress, ולכן pdfrx לא מציג את שלו. כל פעולה שהתפריט
-/// המובנה סיפק חייבת להופיע כאן, אחרת היא נעלמת מהמשתמש (issue #1420).
-@visibleForTesting
-List<AppContextMenuEntry> buildPdfContextMenuEntries({
-  required List<AppContextMenuEntry> commentatorChildren,
-  required bool hasRelevantCommentators,
-  required bool canSelectCommentators,
-  required AppContextMenuEntry linksEntry,
-  required bool hasTextSelection,
-  required ReaderMenuSelection? selection,
-  required bool canCopySelection,
-  required VoidCallback onSearchInBook,
-  required VoidCallback onSearchAllBooks,
-  required VoidCallback onCopySelection,
-  required VoidCallback onAddBookmark,
-  required VoidCallback onAddNote,
-}) {
-  return [
-    // שורת אייקונים עליונה בסגנון Windows 11, כמו בתצוגת הטקסט.
-    AppContextMenuEntry.iconRow([
-      buildSearchAllBooksIconAction(
-        selection: selection ?? ReaderMenuSelection(null),
-        enabled: hasTextSelection && (selection?.hasText ?? true),
-        onTap: onSearchAllBooks,
-      ),
-      AppContextMenuIconAction(
-        label: 'העתקה',
-        icon: FluentIcons.copy_24_regular,
-        enabled: canCopySelection,
-        onTap: onCopySelection,
-      ),
-      AppContextMenuIconAction(
-        label: 'הערה',
-        tooltip: 'הוסף הערה אישית',
-        icon: FluentIcons.note_add_24_regular,
-        onTap: onAddNote,
-      ),
-    ]),
-    const AppContextMenuEntry.divider(),
-    AppContextMenuEntry(
-      label: 'חיפוש בספר',
-      icon: FluentIcons.search_24_regular,
-      onTap: onSearchInBook,
-    ),
-    AppContextMenuEntry(
-      label: 'מפרשים',
-      icon: OtzariaIcons.book_24_regular,
-      // התת-תפריט פעיל אם יש בדף מפרשים זמינים, או אם ניתן לפתוח את
-      // חלונית בחירת המפרשים (כדי לאפשר בחירה התחלתית גם בדף ללא מפרשים).
-      enabled: hasRelevantCommentators || canSelectCommentators,
-      children: commentatorChildren,
-    ),
-    linksEntry,
-    const AppContextMenuEntry.divider(),
-    AppContextMenuEntry(
-      label: 'הוסף סימניה לעמוד זה',
-      icon: FluentIcons.bookmark_add_24_regular,
-      onTap: onAddBookmark,
-    ),
-  ];
-}
-
-/// מרווח השדרה בין שני עמודי הכפולה, ביחידות נקודות העמוד.
-const double kBookViewSpineGap = 6.0;
-
 /// המקום המינימלי לקורא כדי שחלונית הניווט תידחק ליד התוכן. מתחת לזה היא
 /// נפתחת כ-overlay, ואין טעם בכפתור נעיצה.
 const double _kNavMinMainContentWidth = 200;
-
-/// פריסת הכפולות בתצוגת ספר, ביחידות נקודות העמוד.
-///
-/// קנה המידה הוא 1 במכוון: מלבן עמוד קטן מגודלו בנקודות גורם ל-pdfrx לרנדר
-/// את הגזיר החד בקנה המידה בריבוע, והתוצאה מטושטשת (issue #1011).
-@visibleForTesting
-PdfPageLayout buildBookViewPageLayout({
-  required List<Size> pageSizes,
-  required bool hasCover,
-  required double verticalMargin,
-}) {
-  final pageLayouts = <Rect>[];
-  const gap = kBookViewSpineGap;
-  double totalHeight = 0;
-
-  for (int i = 0; i < pageSizes.length; i++) {
-    final current = pageSizes[i];
-
-    if (hasCover && i == 0) {
-      pageLayouts.add(
-        Rect.fromLTWH(0, totalHeight, current.width, current.height),
-      );
-      totalHeight += current.height + verticalMargin;
-      continue;
-    }
-
-    final pageIndex = hasCover ? i - 1 : i;
-    if (pageIndex % 2 != 0) continue;
-
-    final next = i + 1 < pageSizes.length ? pageSizes[i + 1] : null;
-    pageLayouts.add(
-      Rect.fromLTWH(
-        current.width + gap,
-        totalHeight,
-        current.width,
-        current.height,
-      ),
-    );
-
-    if (next != null) {
-      pageLayouts.add(Rect.fromLTWH(0, totalHeight, next.width, next.height));
-      totalHeight += max(current.height, next.height) + verticalMargin;
-      i++;
-    } else {
-      totalHeight += current.height + verticalMargin;
-    }
-  }
-
-  return PdfPageLayout(
-    pageLayouts: pageLayouts,
-    documentSize: Size(
-      pageLayouts.fold(0, (width, page) => max(width, page.right)),
-      totalHeight,
-    ),
-  );
-}
-
-/// יחס הפיקסלים של צילום הדפדוף: עד 1.6MP לכל החלון, ולא יותר מ-1.35.
-@visibleForTesting
-double pdfSpreadSnapshotPixelRatio({
-  required Size viewSize,
-  required double devicePixelRatio,
-}) {
-  final viewportPixels = viewSize.width * viewSize.height;
-  const maxCapturePixels = 1600000.0;
-  final cappedPixelRatio = viewportPixels <= 0
-      ? 1.0
-      : sqrt(maxCapturePixels / viewportPixels);
-  return min(devicePixelRatio, min(1.35, cappedPixelRatio));
-}
-
-/// קנה המידה לרינדור עמוד לצילום הדפדוף: מה שהצילום מצייר בפועל (בתצוגת ספר
-/// מלבן העמוד = גודלו בנקודות), ולא יותר מ-1.5 — 2.0 הקריס מכונות חלשות.
-/// מעוגל למעלה לחזקת 2, כדי שזום בגלגלת לא ירנדר את הכפולות מחדש בכל צעד.
-@visibleForTesting
-double pdfSpreadPageRenderScale({
-  required double zoom,
-  required double snapshotPixelRatio,
-}) {
-  final needed = zoom * snapshotPixelRatio;
-  if (!needed.isFinite || needed <= 0) return 1.5;
-  return min(1.5, pow(2, (log(needed) / ln2).ceil()).toDouble());
-}
-
-/// מחזיר את אותו [PdfPageLayout] כל עוד מידות העמודים והפרמטרים לא השתנו —
-/// pdfrx קורא ל-layoutPages בכל בנייה, ומופע זהה מקצר אצלו את ההשוואה.
-@visibleForTesting
-class BookViewLayoutMemo {
-  PdfPageLayout? _layout;
-  List<double> _sizes = const [];
-  bool? _hasCover;
-  double? _verticalMargin;
-
-  PdfPageLayout layout(
-    List<PdfPage> pages, {
-    required bool hasCover,
-    required double verticalMargin,
-  }) {
-    final cached = _layout;
-    if (cached != null &&
-        hasCover == _hasCover &&
-        verticalMargin == _verticalMargin &&
-        _sameSizes(pages)) {
-      return cached;
-    }
-    _hasCover = hasCover;
-    _verticalMargin = verticalMargin;
-    _sizes = [
-      for (final page in pages) ...[page.width, page.height],
-    ];
-    return _layout = buildBookViewPageLayout(
-      pageSizes: [for (final page in pages) Size(page.width, page.height)],
-      hasCover: hasCover,
-      verticalMargin: verticalMargin,
-    );
-  }
-
-  bool _sameSizes(List<PdfPage> pages) {
-    if (_sizes.length != pages.length * 2) return false;
-    for (var i = 0; i < pages.length; i++) {
-      if (_sizes[i * 2] != pages[i].width ||
-          _sizes[i * 2 + 1] != pages[i].height) {
-        return false;
-      }
-    }
-    return true;
-  }
-}
 
 class _PdfBookScreenState extends State<PdfBookScreen>
     with
@@ -719,15 +246,19 @@ class _PdfBookScreenState extends State<PdfBookScreen>
   bool _isChoosingPersonalNotePoint = false;
   PersonalNote? _noteToReanchor;
   PdfNoteAnchor? _focusedPersonalNoteAnchor;
+  final _pdfNotePageLookup = PdfNotePageLookup();
   List<int> _lastVisiblePdfNotePages = const [];
   bool _visiblePdfNotesRefreshScheduled = false;
   late final StreamSubscription<SettingsState> _settingsSub;
   StreamSubscription<LibraryState>? _libraryReloadSub;
   late final AnimationController _pageTurnController;
 
-  // גלילה רציפה
+  // גלילה רציפה בחיצים: צעד ללחיצה, ומהירות קבועה בהחזקה.
+  static const double _arrowScrollStep = 100.0;
+  static const double _arrowScrollSpeed = 500.0;
+  static const int _arrowScrollHoldDelayMicros = 100000;
+  static const int _arrowScrollMaxTickMicros = 50000;
   Timer? _scrollTimer;
-  LogicalKeyboardKey? _currentScrollKey;
   int? _scrollAnchorPage;
   int? _lockedSpreadStartPage;
   ui.Image? _pageTurnSnapshot;
@@ -1684,6 +1215,7 @@ class _PdfBookScreenState extends State<PdfBookScreen>
     otz_links.Link link,
   ) async {
     final textBook = TextBook(
+      id: link.targetBookId,
       title: utils.getTitleFromPath(link.path2),
       source: link.targetSource,
       categoryId: link.targetCategoryId,
@@ -1701,6 +1233,7 @@ class _PdfBookScreenState extends State<PdfBookScreen>
         ignoreHistory: true,
         requiresStableLayout: true,
         insertAdjacent: true,
+        navigateToPositionIfReused: true,
       );
       return;
     }
@@ -1709,8 +1242,9 @@ class _PdfBookScreenState extends State<PdfBookScreen>
       textBook,
       textIndex,
       '',
-      ignoreHistory: false,
+      explicitIndex: true,
       insertAdjacent: true,
+      navigateToPositionIfReused: true,
     );
   }
 
@@ -2925,19 +2459,6 @@ class _PdfBookScreenState extends State<PdfBookScreen>
       zoom: newZoom,
       viewSize: viewSize,
     );
-  }
-
-  bool _wasMatrixClamped({
-    required Matrix4 original,
-    required Matrix4 clamped,
-    required Size viewSize,
-  }) {
-    final originalRect = original.calcVisibleRect(viewSize);
-    final clampedRect = clamped.calcVisibleRect(viewSize);
-
-    return (original.zoom - clamped.zoom).abs() > 0.001 ||
-        (originalRect.center.dx - clampedRect.center.dx).abs() > 0.1 ||
-        (originalRect.center.dy - clampedRect.center.dy).abs() > 0.1;
   }
 
   /// מרכז-X של יעד הניווט: כשהזום מציג רק חלק מהזוג, המיקוד הוא על עמוד
@@ -5631,18 +5152,21 @@ class _PdfBookScreenState extends State<PdfBookScreen>
   }
 
   void _startContinuousScroll(LogicalKeyboardKey key) {
-    if (_scrollTimer != null) return;
-
-    _currentScrollKey = key;
-    _captureScrollAnchor();
-
-    if (key == LogicalKeyboardKey.arrowUp) {
-      _scrollUpSimple();
-    } else if (key == LogicalKeyboardKey.arrowDown) {
-      _scrollDownSimple();
+    final controller = widget.tab.pdfViewerController;
+    if (_scrollTimer != null || !controller.isReady || _isPageTurnInProgress) {
+      return;
     }
 
-    _scrollTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+    // ניווט פעיל יזיז את המטריצה ויבטל את הגלילה של ה-delegate.
+    unawaited(controller.goTo(controller.value, duration: Duration.zero));
+    _captureScrollAnchor();
+    final direction = key == LogicalKeyboardKey.arrowUp ? 1.0 : -1.0;
+    _scrollPhysicsProvider.pan(Offset(0, direction * _arrowScrollStep));
+
+    // תנועה רציפה לפי הזמן שעבר; הלחיצה הראשונה כבר כיסתה את ה-100ms הראשונות.
+    final clock = Stopwatch()..start();
+    var scrolledUntilMicros = _arrowScrollHoldDelayMicros;
+    _scrollTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
       if (!mounted || !widget.tab.pdfViewerController.isReady) {
         _stopContinuousScroll();
         return;
@@ -5652,27 +5176,35 @@ class _PdfBookScreenState extends State<PdfBookScreen>
         _pdfViewFocusNode.requestFocus();
       }
 
-      final isUpPressed = HardwareKeyboard.instance.logicalKeysPressed.contains(
-        LogicalKeyboardKey.arrowUp,
-      );
-      final isDownPressed = HardwareKeyboard.instance.logicalKeysPressed
-          .contains(LogicalKeyboardKey.arrowDown);
-
-      if (_currentScrollKey == LogicalKeyboardKey.arrowUp && isUpPressed) {
-        _scrollUpSimple();
-      } else if (_currentScrollKey == LogicalKeyboardKey.arrowDown &&
-          isDownPressed) {
-        _scrollDownSimple();
-      } else {
+      if (!HardwareKeyboard.instance.logicalKeysPressed.contains(key)) {
         _stopContinuousScroll();
+        return;
       }
+
+      final nowMicros = clock.elapsedMicroseconds;
+      // בזמן דפדוף אין נרמול לכפולה, וגלילה מתחת לשכבת הדפדוף לא תינעל.
+      if (_isPageTurnInProgress) {
+        scrolledUntilMicros = max(scrolledUntilMicros, nowMicros);
+        _scrollAnchorPage = null;
+        return;
+      }
+      if (nowMicros <= scrolledUntilMicros) return;
+      _scrollAnchorPage ??= widget.tab.pdfViewerController.pageNumber ?? 1;
+      // משליכים את רוב הזמן שעבר אם הממשק נתקע, כדי למנוע קפיצה בגלילה.
+      final elapsedMicros = min(
+        nowMicros - scrolledUntilMicros,
+        _arrowScrollMaxTickMicros,
+      );
+      scrolledUntilMicros = nowMicros;
+      _scrollPhysicsProvider.pan(
+        Offset(0, direction * _arrowScrollSpeed * elapsedMicros / 1e6),
+      );
     });
   }
 
   void _stopContinuousScroll() {
     _scrollTimer?.cancel();
     _scrollTimer = null;
-    _currentScrollKey = null;
     _scrollAnchorPage = null;
 
     if (mounted && !_pdfViewFocusNode.hasFocus) {
@@ -5683,54 +5215,6 @@ class _PdfBookScreenState extends State<PdfBookScreen>
   void _captureScrollAnchor() {
     if (!widget.tab.pdfViewerController.isReady) return;
     _scrollAnchorPage = widget.tab.pdfViewerController.pageNumber ?? 1;
-  }
-
-  void _applyVerticalScroll(double deltaY) {
-    if (!widget.tab.pdfViewerController.isReady) return;
-
-    final currentMatrix = widget.tab.pdfViewerController.value;
-    final currentTranslation = currentMatrix.getTranslation();
-    final candidateMatrix = currentMatrix.clone()
-      ..setTranslationRaw(
-        currentTranslation.x,
-        currentTranslation.y + deltaY,
-        currentTranslation.z,
-      );
-
-    if (!_isBookViewModeActive()) {
-      widget.tab.pdfViewerController.goTo(candidateMatrix);
-      return;
-    }
-
-    final anchorPage =
-        _scrollAnchorPage ?? (widget.tab.pdfViewerController.pageNumber ?? 1);
-    final clampedMatrix = _clampMatrixToSpread(
-      matrix: candidateMatrix,
-      viewSize: widget.tab.pdfViewerController.viewSize,
-      layout: widget.tab.pdfViewerController.layout,
-      controller: widget.tab.pdfViewerController,
-      spreadStartPage: _spreadStartPageFor(anchorPage),
-    );
-
-    widget.tab.pdfViewerController.goTo(clampedMatrix);
-
-    if (_wasMatrixClamped(
-      original: candidateMatrix,
-      clamped: clampedMatrix,
-      viewSize: widget.tab.pdfViewerController.viewSize,
-    )) {
-      _stopContinuousScroll();
-    }
-  }
-
-  void _scrollUpSimple() {
-    const double scrollAmount = 100.0;
-    _applyVerticalScroll(scrollAmount);
-  }
-
-  void _scrollDownSimple() {
-    const double scrollAmount = 100.0;
-    _applyVerticalScroll(-scrollAmount);
   }
 
   Future<void> navigateToUrl(Uri url) async {
@@ -6269,15 +5753,16 @@ class _PdfBookScreenState extends State<PdfBookScreen>
     if (!context.mounted) return;
 
     if (index == null) {
-      UiSnack.show(PdfMessages.textLocationNotFoundOpeningAtStart);
+      UiSnack.show(PdfMessages.textLocationNotFound);
     }
     openBook(
       context,
       textBook,
-      index ?? 0,
+      index,
       '',
       ignoreHistory: true,
       insertAdjacent: true,
+      navigateToPositionIfReused: true,
     );
   }
 
@@ -6353,21 +5838,17 @@ class _PdfBookScreenState extends State<PdfBookScreen>
 
   List<int> _visiblePersonalNotePages() {
     final controller = widget.tab.pdfViewerController;
-    if (!controller.isReady) return const [];
-    final visible = visiblePdfNotePageNumbers(
-      pageLayouts: controller.layout.pageLayouts,
-      visibleRect: controller.visibleRect,
+    final layout = pdfReadyLayoutOrNull(controller);
+    if (layout == null) return const [];
+    return _pdfNotePageLookup.visiblePages(
+      layout,
+      controller.visibleRect,
+      spread: _isBookViewModeActive()
+          ? _spreadPageRangeFor(
+              _pageNumberNotifier.value ?? widget.tab.pageNumber,
+            )
+          : null,
     );
-    if (!_isBookViewModeActive()) return visible;
-    final range = _spreadPageRangeFor(
-      _pageNumberNotifier.value ?? widget.tab.pageNumber,
-    );
-    // בתצוגת ספר המסכה מסתירה כפולות אחרות, גם אם הן בתוך מלבן הצפיין.
-    return visible
-        .where(
-          (page) => page >= range.startPage && page < range.endPageExclusive,
-        )
-        .toList();
   }
 
   void _refreshVisiblePersonalNotePages() {

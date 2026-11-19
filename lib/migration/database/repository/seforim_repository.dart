@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:logging/logging.dart';
+import 'package:otzaria/data/data_providers/db_read_worker.dart';
 import 'package:otzaria/data/sqlite/sqlite3_api.dart' as sqlite3;
 
 import '../../../book_protection/utils/banner_title.dart';
@@ -29,6 +30,7 @@ import '../book_read.dart';
 import '../db_capabilities.dart';
 import '../line_content_encoder.dart';
 import '../sqlite3_utils.dart';
+import '../untrusted_database.dart';
 
 part 'alt_toc_flat_index.dart';
 
@@ -360,6 +362,50 @@ class SeforimRepository {
     return result.map((row) => row['descendantId'] as int).toList();
   }
 
+  /// האם בענף יש ספר שהמקור או הנתיב שלו מוכיחים שיוך לתיקייה מוגדרת.
+  Future<bool> hasCustomFolderOwnership(
+    int categoryId,
+    bool Function(String? sourceName, String? filePath) ownsBook,
+  ) async {
+    final capabilities = await _capabilities;
+    if (!capabilities.hasCategoryClosure || !capabilities.hasBookCategories) {
+      return false;
+    }
+    final filePath = capabilities.column('book', 'filePath', qualifier: 'b');
+    final hasSource = capabilities.hasColumn('source', 'name');
+    final sourceId = capabilities.hasColumn('book', 'sourceId')
+        ? 'COALESCE(b.sourceId, 0)'
+        : '0';
+    final sourceName = hasSource ? 's.name' : 'NULL';
+    final sourceJoin = hasSource
+        ? 'LEFT JOIN source s ON s.id = $sourceId'
+        : '';
+    final db = await _database.database;
+    // מתחילים בצאצאי הענף, כדי לעצור בלי לסרוק ספרים מחוץ לענף.
+    final statement = db.prepare('''
+      SELECT $sourceName AS sourceName, $filePath
+      FROM category_closure c
+      CROSS JOIN book b ON b.categoryId = c.descendantId
+      $sourceJoin
+      WHERE c.ancestorId = ?
+    ''');
+    try {
+      final cursor = statement.selectCursor([categoryId]);
+      while (cursor.moveNext()) {
+        final row = cursor.current;
+        if (ownsBook(
+          row['sourceName'] as String?,
+          row['filePath'] as String?,
+        )) {
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      statement.close();
+    }
+  }
+
   // --- Categories ---
 
   /// Retrieves all categories.
@@ -509,6 +555,10 @@ class SeforimRepository {
       pubDates: pubDates,
     );
   }
+
+  /// ספרי קטגוריה ללא טעינת היחסים, כשדרושים רק שדות שורת הספר.
+  Future<List<Book>> getBooksByCategoryLean(int categoryId) =>
+      _database.bookDao.getBooksByCategory(categoryId);
 
   /// Retrieves all books in a specific category.
   ///
@@ -936,48 +986,12 @@ class SeforimRepository {
         booksByTitle: const <String, List<({int id, int? categoryId})>>{},
       );
     }
-    final db = await _database.database;
-    final levels = <int, int>{
-      if (capabilities.hasBookProtection)
-        for (final row in db.select(
-          'SELECT bookId, level FROM book_protection',
-        ))
-          if (row['bookId'] is int && row['level'] is int)
-            row['bookId'] as int: row['level'] as int,
-    };
-    final banners = <int, String>{
-      if (capabilities.hasBookBanners)
-        for (final row in db.select(
-          'SELECT bb.bookId, b.title, n.text FROM book_banner bb '
-          'JOIN banner n ON n.id = bb.bannerId JOIN book b ON b.id = bb.bookId',
-        ))
-          if (row['bookId'] is int &&
-              row['title'] is String &&
-              row['text'] is String)
-            row['bookId'] as int: expandBannerTitle(
-              row['text'] as String,
-              row['title'] as String,
-            ),
-    };
-    // רק הספרים שבטבלאות — כדי שאיתור לפי כותרת ייעשה בזיכרון.
-    final booksByTitle = <String, List<({int id, int? categoryId})>>{};
-    if (levels.isNotEmpty || banners.isNotEmpty) {
-      final categoryColumn = capabilities.column('book', 'categoryId');
-      final idSources = [
-        if (capabilities.hasBookProtection)
-          'SELECT bookId FROM book_protection',
-        if (capabilities.hasBookBanners) 'SELECT bookId FROM book_banner',
-      ].join(' UNION ');
-      for (final row in db.select(
-        'SELECT id, title, $categoryColumn FROM book WHERE id IN ($idSources)',
-      )) {
-        booksByTitle.putIfAbsent(row['title'] as String, () => []).add((
-          id: row['id'] as int,
-          categoryId: row['categoryId'] as int?,
-        ));
-      }
+    if (!_database.isOfficial) {
+      return _readBookProtectionTables(await _database.database, capabilities);
     }
-    return (levels: levels, banners: banners, booksByTitle: booksByTitle);
+    return DbReadWorker.runMetadataOnFreshIsolate(
+      _protectionTablesOnTarget(_database.readOnlyTarget, capabilities),
+    );
   }
 
   // --- Sources ---
@@ -2229,34 +2243,67 @@ extension BookAcronymRepository on SeforimRepository {
         ? await _buildAltTocCacheForBook(bookId, bookTitle)
         : const <AltTocIndexEntry>[];
     if (compactEntries?.isNotEmpty ?? altCache.isNotEmpty) {
-      // ציטוט דף, או טוקן בודד שה-AltToc כבר מוצא ("זהר לו"), מטופלים שם.
-      // אחרת ("בית יוסף תקיב") מותר לדלג על חלק ביניים, בהתאמה לכותרת היעד עצמה.
-      if (_isDafCitationForAltTocFallback(queryTokens) ||
-          (queryTokens.length == 1 &&
-              (index != null
-                  ? _searchAltTocFlat(
-                      compactEntries!,
-                      queryTokens,
-                      ownTokensOf: index._ownTokensOf,
-                      pathTokensOf: index.refTokensOf,
-                      refMaskOf: (i) => index.refMasks[i],
-                    ).isNotEmpty
-                  : _searchAltTocFlat(
-                      altCache,
-                      queryTokens,
-                      ownTokensOf: (entry) => entry.ownTokens,
-                      pathTokensOf: (entry) => entry.pathTokens,
-                    ).isNotEmpty))) {
+      late final hasAltMatch = index != null
+          ? _searchAltTocFlat(
+              compactEntries!,
+              queryTokens,
+              ownTokensOf: index._ownTokensOf,
+              pathTokensOf: index.refTokensOf,
+              refMaskOf: (i) => index.refMasks[i],
+            ).isNotEmpty
+          : _searchAltTocFlat(
+              altCache,
+              queryTokens,
+              ownTokensOf: (entry) => entry.ownTokens,
+              pathTokensOf: (entry) => entry.pathTokens,
+            ).isNotEmpty;
+
+      final isDafCitation = _isDafCitationForAltTocFallback(queryTokens);
+      if (queryTokens.length == 1 && hasAltMatch) return const [];
+      if (isDafCitation &&
+          (queryTokens.contains('דף') || queryTokens.contains('עמוד'))) {
         return const [];
       }
-      return _searchTocFlat(
+      if (!isDafCitation) {
+        final strict = _searchTocFlat(
+          cache,
+          queryTokens,
+          requireAllTokensInOwnHeading: true,
+        );
+        if (strict.isNotEmpty) return strict.map((e) => e.toMap()).toList();
+      }
+
+      // אות א/ב יכולה לציין גם סעיף קטן וגם עמוד. התאמה תחת סימן
+      // מותרת רק כשהמבנה החלופי אינו מציע יעד קיים.
+      final underTitle = _searchUnderTitleHeading(
         cache,
         queryTokens,
-        requireAllTokensInOwnHeading: true,
-      ).map((e) => e.toMap()).toList();
+        simanimOnly: isDafCitation,
+      );
+      if (underTitle.isEmpty || hasAltMatch) return const [];
+      return underTitle.map((e) => e.toMap()).toList();
     }
 
-    return _searchTocFlat(cache, queryTokens).map((e) => e.toMap()).toList();
+    final flat = _searchTocFlat(cache, queryTokens);
+    return (flat.isEmpty ? _searchUnderTitleHeading(cache, queryTokens) : flat)
+        .map((e) => e.toMap())
+        .toList();
+  }
+
+  /// שם הספר כבר נצרך מהשאילתה, וכשכותרת שם הספר היא השורש ("חוות דעת צד י")
+  /// מנסים שוב מילדיה. רק התאמה שלמה, כדי לא להחליף "לא נמצא" בניחוש.
+  List<_CachedTocEntry> _searchUnderTitleHeading(
+    _TocBookCache cache,
+    List<String> tokens, {
+    bool simanimOnly = false,
+  }) {
+    final children = cache.titleHeadingChildren;
+    if (children.isEmpty) return const [];
+    final roots = simanimOnly
+        ? children.where((e) => e.ownTokens.firstOrNull == 'סימן').toList()
+        : children;
+    final result = _searchTocHierarchically(cache, tokens, roots: roots);
+    return result.complete ? result.matches : const [];
   }
 
   /// [parseDafCitation] מקבל בכוונה כל רצף קצר של אותיות עבריות, כדי לתמוך
@@ -2726,6 +2773,7 @@ extension BookAcronymRepository on SeforimRepository {
       all: built,
       rootEntries: rootEntries,
       childrenByParentId: childrenByParentId,
+      titleHeadingChildren: childrenByParentId[titleHeadingId] ?? const [],
       titleHeadingTokens: titleHeadingId == null
           ? const []
           : tokensByTextId[roots.single.textId]!,
@@ -2739,20 +2787,22 @@ extension BookAcronymRepository on SeforimRepository {
   /// [complete] = false כשהירידה נעצרה לפני סוף השאילתה ("פרק א" ל"א ב").
   ({List<_CachedTocEntry> matches, bool complete}) _searchTocHierarchically(
     _TocBookCache cache,
-    List<String> tokens,
-  ) {
+    List<String> tokens, {
+    List<_CachedTocEntry>? roots,
+  }) {
+    final rootEntries = roots ?? cache.rootEntries;
     // קיצור ציטוט-דף: כשהרמה העליונה מורכבת מערכי "דף" (מסכת גמרא רגילה)
     // והשאילתה היא ציטוט דף, התאמה מיקומית מכריעה — גם כשהתוצאה ריקה.
     // נפילה לחיפוש הרגיל הייתה מציפה: טוקן "ב" בודד נתפס ע"י סימון צד ע"ב
     // של כל דף (פירוש דליל שאין בו דף ב' החזיר את דפי ה:/ו:/ז:).
     final cite = parseDafCitation(tokens);
     if (cite != null) {
-      final rootHasDaf = cache.rootEntries.any(
+      final rootHasDaf = rootEntries.any(
         (e) => e.ownTokens.isNotEmpty && e.ownTokens.first == 'דף',
       );
       if (rootHasDaf) {
         return (
-          matches: cache.rootEntries
+          matches: rootEntries
               .where((e) => matchDafCitation(e.ownTokens, cite) == true)
               .toList(),
           complete: true,
@@ -2760,7 +2810,7 @@ extension BookAcronymRepository on SeforimRepository {
       }
     }
 
-    var searchScope = cache.rootEntries;
+    var searchScope = rootEntries;
     var currentMatches = <_CachedTocEntry>[];
 
     for (var i = 0; i < tokens.length; i++) {
@@ -3284,6 +3334,9 @@ class _TocBookCache {
   /// מיפוי id → ילדים ישירים (ממוינים לפי segment).
   final Map<int, List<_CachedTocEntry>> childrenByParentId;
 
+  /// ילדי כותרת שם הספר, כשהיא השורש היחיד של ה-TOC.
+  final List<_CachedTocEntry> titleHeadingChildren;
+
   /// מילות השורש שקוצר בתצוגה; משותפות רק לספר שכל ערכיו תחת אותו שורש.
   final List<String> titleHeadingTokens;
 
@@ -3301,7 +3354,67 @@ class _TocBookCache {
     required this.all,
     required this.rootEntries,
     required this.childrenByParentId,
+    this.titleHeadingChildren = const [],
     this.hasBareDafHeadings = false,
     this.titleHeadingTokens = const [],
   });
+}
+
+// סגירת ה-isolate לוכדת רק את היעד ומפת הסכמה, בלי חיבור SQLite.
+BookProtectionTables Function() _protectionTablesOnTarget(
+  ReadOnlyDbTarget target,
+  DbCapabilities capabilities,
+) => () {
+  final db = openReadOnlyTarget(target);
+  try {
+    return _readBookProtectionTables(db, capabilities);
+  } finally {
+    db.close();
+  }
+};
+
+BookProtectionTables _readBookProtectionTables(
+  sqlite3.Database db,
+  DbCapabilities capabilities,
+) {
+  final levels = <int, int>{
+    if (capabilities.hasBookProtection)
+      for (final row in db.select(
+        'SELECT bookId, level FROM book_protection',
+      ))
+        if (row['bookId'] is int && row['level'] is int)
+          row['bookId'] as int: row['level'] as int,
+  };
+  final banners = <int, String>{
+    if (capabilities.hasBookBanners)
+      for (final row in db.select(
+        'SELECT bb.bookId, b.title, n.text FROM book_banner bb '
+        'JOIN banner n ON n.id = bb.bannerId JOIN book b ON b.id = bb.bookId',
+      ))
+        if (row['bookId'] is int &&
+            row['title'] is String &&
+            row['text'] is String)
+          row['bookId'] as int: expandBannerTitle(
+            row['text'] as String,
+            row['title'] as String,
+          ),
+  };
+  // רק הספרים שבטבלאות — כדי שאיתור לפי כותרת ייעשה בזיכרון.
+  final booksByTitle = <String, List<({int id, int? categoryId})>>{};
+  if (levels.isNotEmpty || banners.isNotEmpty) {
+    final categoryColumn = capabilities.column('book', 'categoryId');
+    final idSources = [
+      if (capabilities.hasBookProtection) 'SELECT bookId FROM book_protection',
+      if (capabilities.hasBookBanners) 'SELECT bookId FROM book_banner',
+    ].join(' UNION ');
+    for (final row in db.select(
+      'SELECT id, title, $categoryColumn FROM book WHERE id IN ($idSources)',
+    )) {
+      booksByTitle.putIfAbsent(row['title'] as String, () => []).add((
+        id: row['id'] as int,
+        categoryId: row['categoryId'] as int?,
+      ));
+    }
+  }
+  return (levels: levels, banners: banners, booksByTitle: booksByTitle);
 }

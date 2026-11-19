@@ -5,30 +5,34 @@ import 'dart:isolate';
 import 'package:otzaria/text_book/repository/book_notes_repository.dart';
 import 'package:otzaria/divine_names/repository/divine_names_repository.dart';
 import 'package:flutter/foundation.dart'
-    show ValueNotifier, debugPrint, visibleForTesting, compute;
+    show debugPrint, visibleForTesting, compute;
 import 'package:sentry_flutter/sentry_flutter.dart';
 import 'package:otzaria/attached_libraries/models/attached_library.dart';
 import 'package:otzaria/attached_libraries/repository/attached_libraries_repository.dart';
 import 'package:otzaria/attached_libraries/repository/attached_library_registry.dart';
 import 'package:otzaria/attached_libraries/repository/external_link_repository.dart';
-import 'package:otzaria/attached_libraries/utils/attached_file_path.dart';
 import 'package:otzaria/data/cache/books_cache.dart';
 import 'package:otzaria/data/constants/database_constants.dart';
 import 'package:otzaria/data/data_providers/book_database_resolver.dart';
+import 'package:otzaria/data/data_providers/attached_catalog_reader.dart';
 import 'package:otzaria/data/data_providers/book_composite_key.dart';
+import 'package:otzaria/data/data_providers/book_key_set.dart';
+import 'package:otzaria/data/data_providers/category_merge_targets.dart';
+import 'package:otzaria/data/data_providers/personal_books_operation_queue.dart';
+import 'package:otzaria/data/data_providers/scan_result.dart';
 import 'package:otzaria/data/data_providers/book_text_reader.dart';
 import 'package:otzaria/data/data_providers/db_read_worker.dart';
 import 'package:otzaria/data/data_providers/library_provider.dart';
 import 'package:otzaria/data/data_providers/official_catalog_rows.dart';
+import 'package:otzaria/data/data_providers/pending_attached_catalog.dart';
 import 'package:otzaria/data/data_providers/sqlite_data_provider.dart';
+import 'package:otzaria/data/data_providers/user_books_catalog_reader.dart';
 import 'package:otzaria/data/data_providers/user_books_database_holder.dart';
 import 'package:otzaria/divine_names/models/divine_name_spans.dart';
 import 'package:otzaria/text_book/models/book_notes.dart';
-import 'package:otzaria/migration/database/daos/book_dao.dart';
 import 'package:otzaria/migration/database/daos/database.dart';
 import 'package:otzaria/migration/database/query_loader.dart';
 import 'package:otzaria/migration/models/toc_entry.dart' as migration;
-import 'package:otzaria/migration/database/daos/category_dao.dart';
 import 'package:otzaria/migration/database/db_capabilities.dart';
 import 'package:otzaria/migration/database/line_content_codec.dart';
 import 'package:otzaria/migration/database/repository/seforim_repository.dart';
@@ -71,6 +75,13 @@ import 'link_visibility_sql.dart';
 import 'package:otzaria/settings/engine/app_settings_store.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:path/path.dart' as p;
+
+export 'package:otzaria/data/data_providers/attached_catalog_reader.dart';
+export 'package:otzaria/data/data_providers/category_merge_targets.dart';
+export 'package:otzaria/data/data_providers/pending_attached_catalog.dart';
+export 'package:otzaria/data/data_providers/personal_books_operation_queue.dart'
+    show PersonalBooksOperationQueue;
+export 'package:otzaria/data/data_providers/scan_result.dart';
 
 /// שם השורש שמרכז את ספרי מסד שאין בו טבלת קטגוריות.
 const kUncategorizedCategoryTitle = 'ללא קטגוריה';
@@ -119,208 +130,6 @@ class _AttachedCatalogBuild {
         library.priority * _kAttachedMergedOrderStride +
         own.clamp(0, _kAttachedMergedOrderStride - 1);
   }
-}
-
-/// קטלוג מסד מצורף כפי שנקרא ב-isolate. [missing] — הקובץ אינו קיים.
-typedef AttachedCatalogRows = ({
-  bool missing,
-  List<Map<String, dynamic>> books,
-  List<Map<String, dynamic>> categories,
-  Map<int, String> authors,
-  List<Map<String, dynamic>> versionLinks,
-});
-
-/// תקרת שורות book_version_link שנקראות ממסד מצורף אחד.
-const kMaxAttachedVersionLinks = 100000;
-
-/// קורא את הקטלוג של מסד מצורף על חיבור מוקשח משלו — רץ ב-isolate, כך
-/// שקובץ איטי או כונן רשת מת אינם חוסמים את בניית העץ.
-AttachedCatalogRows readAttachedCatalogSync(ReadOnlyDbTarget target) {
-  if (!File(target.path).existsSync()) {
-    return (
-      missing: true,
-      books: const [],
-      categories: const [],
-      authors: {},
-      versionLinks: const [],
-    );
-  }
-  final db = openReadOnlyTarget(target);
-  try {
-    final capabilities = DbCapabilities.probe(db);
-    late final List<Map<String, dynamic>> books;
-    late final List<Map<String, dynamic>> categories;
-    late final Map<int, String> authors;
-    var versionLinks = const <Map<String, dynamic>>[];
-    withTransaction(db, () {
-      books = [
-        for (final row in BookDao.selectBooksMinimal(
-          db,
-          capabilities,
-          withFileColumns: true,
-        ))
-          {...row, 'resolvedFilePath': _existingAttachedFile(target, row)},
-      ];
-      categories = CategoryDao.selectCategoryRows(db, capabilities);
-      authors = BookDao.selectBookAuthorsMap(db, capabilities);
-      if (capabilities.hasBookVersionLinks) {
-        String column(String name) =>
-            capabilities.column('book_version_link', name);
-        versionLinks = db
-            .select(
-              'SELECT versionBookId, ${column('primarySource')}, primaryTitle, '
-              '${column('primaryCategoryPath')}, ${column('versionTitle')}, '
-              '${column('versionNotes')}, ${column('priority')} '
-              'FROM book_version_link LIMIT $kMaxAttachedVersionLinks',
-            )
-            .toMapList();
-      }
-    });
-    return (
-      missing: false,
-      books: books,
-      categories: categories,
-      authors: authors,
-      versionLinks: versionLinks,
-    );
-  } finally {
-    db.close();
-  }
-}
-
-/// הקובץ של ספר מבוסס-קובץ במסד מצורף, כשהנתיב מותר והקובץ קיים.
-String? _existingAttachedFile(
-  ReadOnlyDbTarget target,
-  Map<String, dynamic> row,
-) {
-  final resolved = resolveAttachedBookFilePath(
-    target.path,
-    row['filePath'] as String?,
-  );
-  return resolved != null && File(resolved).existsSync() ? resolved : null;
-}
-
-Future<AttachedCatalogRows> _readAttachedCatalogInIsolate(
-  ReadOnlyDbTarget target,
-) => Isolate.run(() => readAttachedCatalogSync(target));
-
-typedef _UserBooksCatalogRows = ({
-  List<Map<String, dynamic>> books,
-  List<Map<String, dynamic>> categories,
-  Map<int, String> authors,
-  List<Map<String, dynamic>> versions,
-  List<Map<String, dynamic>> attachedVersions,
-});
-
-/// בטרנזקציה אחת — תמונת מצב עקבית של כל טבלאות הקטלוג של user_books.db.
-_UserBooksCatalogRows _selectUserBooksCatalog(
-  sqlite3.Database db,
-  DbCapabilities capabilities,
-) {
-  late final _UserBooksCatalogRows rows;
-  withTransaction(db, () {
-    rows = (
-      books: BookDao.selectBooksMinimal(
-        db,
-        capabilities,
-        withFileColumns: true,
-      ),
-      categories: CategoryDao.selectCategoryRows(db, capabilities),
-      authors: BookDao.selectBookAuthorsMap(db, capabilities),
-      versions: db
-          .select(
-            'SELECT versionBookId, primaryBookId, primarySource, primaryTitle, '
-            'primaryCategoryPath, versionTitle, versionNotes, priority '
-            'FROM user_book_version',
-          )
-          .toMapList(),
-      attachedVersions:
-          db
-              .select(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'user_attached_book_version'",
-              )
-              .isEmpty
-          ? const []
-          : db
-                .select(
-                  'SELECT versionDb, versionBookTitle, primarySource, '
-                  'primaryTitle, primaryCategoryPath, versionTitle, '
-                  'versionNotes, priority FROM user_attached_book_version',
-                )
-                .toMapList(),
-    );
-  });
-  return rows;
-}
-
-/// קטלוג user_books.db ופתרון נתיבי הקבצים, על חיבור read-only ב-isolate:
-/// פענוח עשרות אלפי שורות על ה-UI isolate תקע את הממשק (#3515).
-Future<_UserBooksCatalogRows> _readUserBooksCatalogInIsolate(
-  String dbPath,
-  String libraryPath,
-) => Isolate.run(() {
-  final db = openReadOnlyTarget(trustedDbTarget(dbPath));
-  try {
-    db.execute('PRAGMA busy_timeout=5000');
-    final rows = _selectUserBooksCatalog(db, DbCapabilities.probe(db));
-    return (
-      books: [
-        for (final row in rows.books)
-          if (row['filePath'] case final String path)
-            {
-              ...row,
-              'filePath': resolveMovedFileBookPath(
-                path,
-                activeLibraryPath: libraryPath,
-              ),
-            }
-          else
-            row,
-      ],
-      categories: rows.categories,
-      authors: rows.authors,
-      versions: rows.versions,
-      attachedVersions: rows.attachedVersions,
-    );
-  } finally {
-    db.close();
-  }
-}, debugName: 'readUserBooksCatalog');
-
-/// יעדי המיזוג ברשימת קטגוריות אחיות, בהשוואה שמתעלמת מגרשיים וגרש: שם תיקייה
-/// ב-Windows לא יכול להכיל `"`, ולכן "תנך" חייב להתאים ל"תנ״ך".
-class _MergeTargets {
-  _MergeTargets(this._categories) {
-    _categories.forEach(_index);
-  }
-
-  final List<Category> _categories;
-  final Map<String, Category> _byKey = {};
-
-  void _index(Category category) => _byKey.putIfAbsent(
-    DatabaseLibraryProvider._mergeTitleKey(category.title),
-    () => category,
-  );
-
-  Category? find(String title) =>
-      _byKey[DatabaseLibraryProvider._mergeTitleKey(title)];
-
-  void add(Category category) {
-    _categories.add(category);
-    _index(category);
-  }
-}
-
-/// קריאת קטלוג של מסד מצורף שעדיין רצה, כולל אחרי שבניית העץ ויתרה עליה.
-class _PendingAttachedCatalog {
-  _PendingAttachedCatalog(this.future) {
-    future.then((_) => done = true, onError: (_) => done = true);
-  }
-
-  final Future<AttachedCatalogRows> future;
-  bool done = false;
-  bool timedOut = false;
 }
 
 typedef _ExternalWriteBatch = ({
@@ -2034,152 +1843,20 @@ Future<List<Map<String, dynamic>>> _runSelectableVersionKeysInIsolate({
   );
 }
 
-/// מתאם כל פעולות הכתיבה לספרים האישיים: add-folder scan, rescan, toggle, remove.
-///
-/// תור סריאלי יחיד עם ספירת עסוקות נצפית.
-/// ה-singleton חי על [DatabaseLibraryProvider] ולכן שורד פירוק ויצירה של widgets.
-class PersonalBooksOperationQueue {
-  Future<void> _tail = Future.value();
-
-  /// מספר הפעולות הממתינות או הרצות כרגע.
-  /// עולה ב-1 מיד כשמוסיפים לתור (לא רק כשמתחיל הביצוע),
-  /// כך שה-UI מציג מצב עסוק גם בזמן ההמתנה בתור.
-  final ValueNotifier<int> busyCount = ValueNotifier(0);
-
-  bool get isBusy => busyCount.value > 0;
-
-  /// מוסיף [operation] לתור הסריאלי ומחזיר את תוצאתה.
-  ///
-  /// פעולות מבוצעות בסדר הוספה בלבד, לעולם לא במקביל.
-  Future<T> enqueue<T>(Future<T> Function() operation) {
-    busyCount.value++; // עולה מיד, עוד לפני הביצוע
-    final result = _tail.then<T>((_) async {
-      try {
-        return await operation();
-      } finally {
-        busyCount.value--;
-      }
-    });
-    // _tail לעולם לא נדחית; אחרת שרשרת ה-then תיקלע לדד-לוק.
-    _tail = result.then<void>((_) {}).catchError((_) {});
-    return result;
-  }
-}
-
-/// תוצאת סריקת תיקייה חיצונית.
-///
-/// [addedBooks]  - מספר הספרים שנוספו ל-DB בהצלחה.
-/// [updatedBooks] - מספר הספרים שעודכנו (שינוי metadata).
-/// [failedBooks]  - מספר הספרים שנכשלו בעיבוד (שגיאה חלקית).
-/// [fatalError]   - שגיאה קטלנית שמנעה את הסריקה כולה (Isolate נפל וכד׳).
-///                  כאשר שגיאה זו קיימת, ספירות הספרים הן 0.
-class ScanResult {
-  final int addedBooks;
-  final int updatedBooks;
-  final int failedBooks;
-  final Object? fatalError;
-  final List<(String title, String reason)> failedDetails;
-
-  /// מזהי ספרים (ב-user_books.db) שקובצם השתנה מאז הסריקה הקודמת —
-  /// דורשים אינדוקס מחדש בחיפוש.
-  final List<int> updatedBookIds;
-
-  const ScanResult({
-    this.addedBooks = 0,
-    this.updatedBooks = 0,
-    this.failedBooks = 0,
-    this.fatalError,
-    this.failedDetails = const [],
-    this.updatedBookIds = const [],
-  });
-
-  bool get isSuccess => fatalError == null;
-  bool get hasPartialFailure => fatalError == null && failedBooks > 0;
-  bool get hasChanges => addedBooks > 0 || updatedBooks > 0;
-}
-
-class _BookKeySet extends SetBase<BookCompositeKey> {
-  static const _matchCacheLimit = 128;
-
-  final Set<BookCompositeKey> _keys = {};
-  final _matches = <(String, String, int?), BookCompositeKey?>{};
-
-  BookCompositeKey? firstMatch(
-    String title,
-    String fileType, [
-    int? categoryId,
-  ]) {
-    if (_keys.isEmpty) return null;
-    final query = (title, fileType, categoryId);
-    if (_matches.containsKey(query)) return _matches[query];
-
-    BookCompositeKey? match;
-    for (final key in _keys) {
-      if (key.title == title &&
-          key.fileType == fileType &&
-          (categoryId == null || key.categoryId == categoryId)) {
-        match = key;
-        break;
-      }
-    }
-    if (_matches.length == _matchCacheLimit) {
-      _matches.remove(_matches.keys.first);
-    }
-    return _matches[query] = match;
-  }
-
-  void _invalidateMatches(BookCompositeKey key) {
-    if (_matches.isEmpty) return;
-    _matches.remove((key.title, key.fileType, null));
-    _matches.remove((key.title, key.fileType, key.categoryId));
-  }
-
-  @override
-  bool add(BookCompositeKey value) {
-    if (!_keys.add(value)) return false;
-    _invalidateMatches(value);
-    return true;
-  }
-
-  @override
-  bool remove(Object? value) {
-    if (value is! BookCompositeKey || !_keys.remove(value)) return false;
-    _invalidateMatches(value);
-    return true;
-  }
-
-  @override
-  void clear() {
-    _keys.clear();
-    _matches.clear();
-  }
-
-  @override
-  bool contains(Object? element) => _keys.contains(element);
-
-  @override
-  BookCompositeKey? lookup(Object? element) => _keys.lookup(element);
-
-  @override
-  Iterator<BookCompositeKey> get iterator => _keys.iterator;
-
-  @override
-  int get length => _keys.length;
-
-  @override
-  Set<BookCompositeKey> toSet() => _keys.toSet();
-}
-
 /// Library provider that loads books from the SQLite database.
 class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
   final SqliteDataProvider _sqliteProvider = SqliteDataProvider.instance;
-  final _cachedKeys = _BookKeySet();
+  final _cachedKeys = BookKeySet();
   final Map<int, String> _categoryIdToPath = {};
   final Map<int, db_models.Category> _categoriesById = {};
   bool _titlesCached = false;
   int _databaseBookKeysGeneration = 0;
   Future<Set<BookCompositeKey>>? _databaseBookKeysInFlight;
-  ({String path, bool exists})? _bundledTalmudBavliDirectoryCache;
+  ({
+    String primary,
+    ({String path, List<String> files}) result,
+  })?
+  _bundledTalmudBavliDirectoryCache;
 
   /// מפתחות "title\u0000categoryId" של ספרים שראוי להציג להם תפריט 'גרסאות',
   /// לפי `BookSource.wireKey`. נטען פעם אחת לכל מסד; מנוקה ב-[clearCache].
@@ -2199,7 +1876,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
   /// מיפוי `(title, categoryId, fileType) → BookCompositeKey` עבור ספרים
   /// שמקורם ב-`user_books.db`. נפרד מ-`_cachedKeys` כדי שהמטמון של seforim
   /// לא ייפגע. כל המפתחות כאן עם `source: BookSource.user`.
-  final _userBooksCachedKeys = _BookKeySet();
+  final _userBooksCachedKeys = BookKeySet();
 
   /// ספרים אישיים לפי מזהה ב-user_books.db — כולל גרסאות שאינן בעץ.
   final Map<int, Book> _userBooksById = {};
@@ -2230,9 +1907,10 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
 
   /// מפתחות ספרי המסדים המצורפים. מזהי הקטגוריות טבעיים לכל מסד, ולכן המקור
   /// (slug) הוא חלק מהמפתח ומנתיבי הקטגוריות.
-  final _attachedCachedKeys = _BookKeySet();
+  final _attachedCachedKeys = BookKeySet();
   final Map<String, Map<int, String>> _attachedCategoryPaths = {};
-  final Map<String, _PendingAttachedCatalog> _pendingAttachedCatalogs = {};
+  final Map<String, PendingAttachedCatalog<AttachedCatalogRows>>
+  _pendingAttachedCatalogs = {};
 
   /// זמן ההמתנה לקטלוג של מסד מצורף אחד. מסד שלא ענה בזמן מסומן לא-זמין,
   /// והעץ נבנה בלעדיו; כשהקריאה מסתיימת המסד חוזר והעץ מתרענן.
@@ -2241,7 +1919,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
 
   @visibleForTesting
   static Future<AttachedCatalogRows> Function(ReadOnlyDbTarget target)
-  attachedCatalogReader = _readAttachedCatalogInIsolate;
+  attachedCatalogReader = readAttachedCatalogInIsolate;
 
   BookCompositeKey? _attachedKeyFor(
     String title,
@@ -2853,27 +2531,24 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     );
   }
 
-  Future<({String path, bool exists})>
+  Future<({String path, List<String> files})>
   _resolveBundledTalmudBavliDirectory() async {
     final candidatePaths = DatabaseConstants.getTalmudBavliDirectoryPaths();
     final cached = _bundledTalmudBavliDirectoryCache;
-    if (cached != null && candidatePaths.contains(cached.path)) return cached;
-
-    final generation = _databaseBookKeysGeneration;
-    var result = (path: candidatePaths.first, exists: false);
-    for (final candidatePath in candidatePaths) {
-      final exists = await Directory(candidatePath).exists();
-      // חילוץ שנקטע משאיר תיקייה עם PDF חלקי וסימון-ביניים; מתעלמים ממנה עד
-      // שההתקנה תושלם, אחרת הספרייה תציג מסכתות עם קבצים חסרים.
-      if (exists &&
-          !DatabaseConstants.isTalmudBavliInstallInProgress(candidatePath)) {
-        result = (path: candidatePath, exists: true);
-        break;
-      }
+    if (cached != null && cached.primary == candidatePaths.first) {
+      return cached.result;
     }
 
+    final generation = _databaseBookKeysGeneration;
+    final result = await DatabaseConstants.findBundledTalmudBavliPdfs(
+      candidatePaths,
+    );
+
     if (generation == _databaseBookKeysGeneration) {
-      _bundledTalmudBavliDirectoryCache = result;
+      _bundledTalmudBavliDirectoryCache = (
+        primary: candidatePaths.first,
+        result: result,
+      );
     }
     return result;
   }
@@ -2884,13 +2559,11 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     'עדיות': (seder: 'סדר נזיקין', after: 'שבועות'),
   };
 
-  Future<void> _addBundledTalmudBavliPdfBooksToCategory(
+  void _addBundledTalmudBavliPdfBooksToCategory(
     Category category,
     Map<String, Map<String, dynamic>> metadata,
-    String bundledPath,
-  ) async {
-    final bundledDir = Directory(bundledPath);
-
+    List<String> pdfPaths,
+  ) {
     // Build a map: title → sub-category that contains a TextBook with that title.
     // This lets us place each PDF next to its matching text book.
     final Map<String, Category> titleToSubCategory = {};
@@ -2911,11 +2584,8 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     final modifiedCategories = <Category>{};
     Category? orphanCategory;
 
-    await for (final entity in bundledDir.list()) {
-      if (entity is! File) continue;
-      if (!entity.path.toLowerCase().endsWith('.pdf')) continue;
-
-      final title = getTitleFromPath(entity.path);
+    for (final pdfPath in pdfPaths) {
+      final title = getTitleFromPath(pdfPath);
       if (existingPdfTitles.contains(title)) continue;
 
       final placement = titleToSubCategory.containsKey(title)
@@ -2971,8 +2641,8 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
         ),
         title: title,
         category: targetCategory,
-        path: entity.path,
-        filePath: entity.path,
+        path: pdfPath,
+        filePath: pdfPath,
         author: bookMeta?['author'] as String?,
         heShortDesc: bookMeta?['heShortDesc'] as String?,
         pubDate: bookMeta?['pubDate'] as String?,
@@ -3114,7 +2784,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
       for (final dbBook in dbBooks) {
         if (!shouldIncludeBookByPath(
           dbBook.filePath,
-          hasTalmudBavliDirectory: bundledTalmud.exists,
+          hasTalmudBavliDirectory: bundledTalmud.files.isNotEmpty,
           talmudBavliDirectoryPath: bundledTalmud.path,
         )) {
           continue;
@@ -3689,7 +3359,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
       for (final book in books) {
         if (!shouldIncludeBookByPath(
           book.filePath,
-          hasTalmudBavliDirectory: bundledTalmud.exists,
+          hasTalmudBavliDirectory: bundledTalmud.files.isNotEmpty,
           talmudBavliDirectoryPath: bundledTalmud.path,
         )) {
           continue;
@@ -3759,7 +3429,6 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     _attachedCachedKeys.clear();
     _attachedCategoryPaths.clear();
     _invalidateDatabaseBookKeys();
-    _bundledTalmudBavliDirectoryCache = null;
     _selectableVersionKeysFutures.clear();
     debugPrint('💾 Database cache cleared');
   }
@@ -3767,6 +3436,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
   void _invalidateDatabaseBookKeys() {
     _databaseBookKeysGeneration++;
     _databaseBookKeysInFlight = null;
+    _bundledTalmudBavliDirectoryCache = null;
     _titlesCached = false;
   }
 
@@ -3872,7 +3542,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     for (final bookData in allDbBooks) {
       if (!shouldIncludeBookByPath(
         bookData['filePath'] as String?,
-        hasTalmudBavliDirectory: bundledTalmud.exists,
+        hasTalmudBavliDirectory: bundledTalmud.files.isNotEmpty,
         talmudBavliDirectoryPath: bundledTalmud.path,
       )) {
         continue;
@@ -3932,11 +3602,11 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     final talmudBavliCategory = library.subCategories.where((category) {
       return category.title == DatabaseConstants.talmudBavliFolderName;
     }).firstOrNull;
-    if (talmudBavliCategory != null && bundledTalmud.exists) {
-      await _addBundledTalmudBavliPdfBooksToCategory(
+    if (talmudBavliCategory != null && bundledTalmud.files.isNotEmpty) {
+      _addBundledTalmudBavliPdfBooksToCategory(
         talmudBavliCategory,
         metadata,
-        bundledTalmud.path,
+        bundledTalmud.files,
       );
     }
 
@@ -4110,16 +3780,16 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
       // הקריאה נכשלת (למשל "database is locked" בזמן כתיבה מקבילית),
       // יוצאים דרך ה-catch בלי לגעת בקאשים או ב-library — והמצב הקודם
       // (ספרי המשתמש שכבר נטענו) נשמר עד הניסיון הבא, במקום להיעלם.
-      _UserBooksCatalogRows rows;
+      UserBooksCatalogRows rows;
       try {
-        rows = await _readUserBooksCatalogInIsolate(
+        rows = await readUserBooksCatalogInIsolate(
           repo.database.path,
           Settings.getValue<String>(SettingsRepository.keyLibraryPath) ?? '',
         );
       } catch (e) {
         debugPrint('⚠️ readUserBooksCatalog failed, reading directly: $e');
         final db = await repo.database.database;
-        final direct = _selectUserBooksCatalog(
+        final direct = selectUserBooksCatalog(
           db,
           DbCapabilities.forDatabase(repo.database.path, db),
         );
@@ -4358,7 +4028,10 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
         final grandchildren = [
           ...?categoriesByParent[pickedFolder.id],
         ]..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
-        final rootTargets = _MergeTargets(library.subCategories);
+        final rootTargets = CategoryMergeTargets(
+          library.subCategories,
+          DatabaseLibraryProvider._mergeTitleKey,
+        );
         for (final grandchild in grandchildren) {
           final existing = rootTargets.find(grandchild.title);
           if (existing == null) {
@@ -4446,7 +4119,7 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     final attachedRepository = AttachedLibrariesRepository.instance;
     final pending = _pendingAttachedCatalogs.putIfAbsent(path, () {
       attachedRepository.setLoading(path, loading: true);
-      return _PendingAttachedCatalog(
+      return PendingAttachedCatalog(
         attachedCatalogReader((
           path: path,
           untrusted: true,
@@ -4553,7 +4226,12 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
       ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
     final merge =
         build.library.placement == AttachedLibraryPlacement.mergeIntoLibrary;
-    final rootTargets = merge ? _MergeTargets(library.subCategories) : null;
+    final rootTargets = merge
+        ? CategoryMergeTargets(
+            library.subCategories,
+            DatabaseLibraryProvider._mergeTitleKey,
+          )
+        : null;
     for (final root in roots) {
       if (rootTargets == null) {
         final parent = ensureLibraryRoot();
@@ -4618,7 +4296,10 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     );
     final children = [...?build.categoriesByParent[dbCategory.id]]
       ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
-    final targets = _MergeTargets(category.subCategories);
+    final targets = CategoryMergeTargets(
+      category.subCategories,
+      DatabaseLibraryProvider._mergeTitleKey,
+    );
     for (final child in children) {
       final existing = targets.find(child.title);
       if (existing == null) {
@@ -4865,7 +4546,10 @@ class DatabaseLibraryProvider implements LibraryProvider, LinkLinesProvider {
     final children = [
       ...?categoriesByParent[dbCategory.id],
     ]..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
-    final targets = _MergeTargets(category.subCategories);
+    final targets = CategoryMergeTargets(
+      category.subCategories,
+      DatabaseLibraryProvider._mergeTitleKey,
+    );
     for (final child in children) {
       final existingSubCategory = targets.find(child.title);
       if (existingSubCategory == null) {

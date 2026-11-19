@@ -31,7 +31,7 @@ import 'package:otzaria/theme/app_surface_colors.dart';
 import 'package:otzaria/theme/app_theme_data.dart';
 import 'package:otzaria/theme/app_tokens.dart';
 import 'package:otzaria/settings/engine/app_settings_store.dart';
-import 'package:kosher_dart/kosher_dart.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:otzaria/update/app_release_version.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -58,6 +58,8 @@ import 'package:otzaria/models/link_types.dart';
 import 'package:otzaria/book_common/models/commentator_group.dart';
 import 'package:otzaria/book_common/utils/commentator_group_builder.dart';
 import 'package:otzaria/library/models/library.dart';
+import 'package:otzaria/search/search_engine_gateway.dart'
+    show isSearchCancelledError, LexicalSearchRequestIds, SearchCountProgress;
 import 'package:otzaria/search/search_repository.dart';
 import 'package:otzaria/search/search_query_builder.dart';
 import 'package:otzaria/plugins/bridge/plugin_reference_resolver.dart';
@@ -186,7 +188,7 @@ import 'package:otzaria/plugins/services/plugin_text_occurrence_service.dart';
 import 'package:otzaria/plugins/services/text_source_map_service.dart';
 import 'package:otzaria/search/utils/facet_helper.dart';
 import 'package:otzaria/widgets/smart_text/render_settings.dart';
-import 'package:otzaria/utils/calendar_days.dart';
+import 'package:otzaria/plugins/bridge/plugin_jewish_date_payload_builder.dart';
 
 /// גופן הממשק שאוצריא מוסרת לתוספים: sans מובנה שנשאר חד ב-11-12px.
 /// גופן הקריאה (`fontFamily`) אינו תחליף לו — הוא מצויר ל-25px,
@@ -369,6 +371,9 @@ class PluginBridgeDependencies {
   })?
   requestPluginInstall;
 
+  /// מבקשת לפתוח את בורר החבילות של אוצריא. התשובה מציינת אם הבקשה התקבלה.
+  final Future<bool> Function()? requestLocalPluginInstall;
+
   /// פותח דיאלוג בחירת תיקייה ומחזיר את הנתיב שנבחר, או `null` אם המשתמש
   /// ביטל. אופציונלי — אם לא סופק, האדפטר משתמש ב-[FilePicker.getDirectoryPath].
   /// קיים בעיקר כדי לאפשר הזרקה בבדיקות (בחירת תיקייה אמיתית אינה זמינה בהן).
@@ -545,6 +550,7 @@ class PluginBridgeDependencies {
     required this.showConfirmDialog,
     required this.showWarningDialog,
     this.requestPluginInstall,
+    this.requestLocalPluginInstall,
     this.pickFolder,
     this.pickFile,
     this.pickSaveLocation,
@@ -2831,6 +2837,9 @@ class PluginBridgeAdapter {
       publicArgs,
       findBook: (identity) => _findPluginBook(library, identity),
     );
+    final regexRequestId = request.regex
+        ? LexicalSearchRequestIds.next()
+        : null;
     final stream = _dependencies.searchRepository.searchTextsStreamWithCounts(
       SearchEngineRequest(
         query: request.sanitizedQuery,
@@ -2854,6 +2863,7 @@ class PluginBridgeAdapter {
         wordMatchMode: request.wordMatchMode,
         wordMatchCount: request.wordMatchCount,
         anyOrder: request.anyOrder,
+        cancelRequestId: regexRequestId,
       ),
       chunkSize: 50,
     );
@@ -2863,9 +2873,20 @@ class PluginBridgeAdapter {
     final iterator = StreamIterator<SearchStreamUpdate>(stream);
     var cancelled = false;
     var expired = false;
+    Future<void>? engineCancellation;
     Future<void> cancel() async {
       cancelled = true;
+      if (regexRequestId != null) {
+        engineCancellation ??= _dependencies.searchRepository
+            .cancelLexicalSearch(regexRequestId)
+            .catchError((Object error) {
+              debugPrint(
+                '[PluginBridge] Failed to cancel regex search: $error',
+              );
+            });
+      }
       await iterator.cancel();
+      await engineCancellation;
     }
 
     if (_pendingSearchCancellations.remove(streamId)) {
@@ -2881,10 +2902,16 @@ class PluginBridgeAdapter {
     int? totalCount;
     int? groupCount;
     var truncated = false;
+    var completed = false;
     final restrictedByPath = <String, bool>{};
     try {
       while (await iterator.moveNext().timeout(_searchIdleTimeout)) {
         final update = iterator.current;
+        final engineUpdate = update is SearchSnapshotUpdate
+            ? update.update
+            : update;
+        // בזרם רג׳קס תוצאות יכולות להקדים את הספירה הסופית.
+        if (request.regex && engineUpdate is SearchCountProgress) continue;
         if (update.totalCount != null) {
           totalCount = update.totalCount;
           groupCount = update.groupCount;
@@ -2945,15 +2972,31 @@ class PluginBridgeAdapter {
         });
       }
       if (expired) throw TimeoutException('Search stream timed out');
+      completed = !cancelled;
       return {
-        'completed': !cancelled,
+        'completed': completed,
         'cancelled': cancelled,
         'chunks': sequence,
       };
+    } catch (error) {
+      if (request.regex && isSearchCancelledError(error)) {
+        if (expired) throw TimeoutException('Search stream timed out');
+        return {'completed': false, 'cancelled': true, 'chunks': sequence};
+      }
+      if (request.regex && error.toString().contains('invalid user regex:')) {
+        throw Exception(
+          'error.invalid_params: query must be a valid /…/ regex',
+        );
+      }
+      rethrow;
     } finally {
       deadline.cancel();
       _activeSearchStreams.remove(streamId);
-      await iterator.cancel();
+      if (request.regex && !completed) {
+        await cancel();
+      } else {
+        await iterator.cancel();
+      }
     }
   }
 
@@ -7715,121 +7758,8 @@ class PluginBridgeAdapter {
   // flutter_local_notifications דוחה מזהה שאינו נכנס ב-32 ביט.
   static int _newNotificationId() => math.Random().nextInt(0x7FFFFFFF);
 
-  Map<String, dynamic> _buildJewishDatePayload(DateTime date, bool inIsrael) {
-    final jewishCalendar = JewishCalendar.fromDateTime(date)
-      ..inIsrael = inIsrael;
-    final formatter = HebrewDateFormatter()..hebrewFormat = true;
-
-    return {
-      'year': jewishCalendar.getJewishYear(),
-      'month': jewishCalendar.getJewishMonth(),
-      'day': jewishCalendar.getJewishDayOfMonth(),
-      'gregorian': date.toIso8601String(),
-      'monthName': formatter.formatMonth(jewishCalendar),
-      'isLeapYear': jewishCalendar.isJewishLeapYear(),
-      'isShabbat': jewishCalendar.getDayOfWeek() == 7,
-      'parasha': _upcomingParasha(date, inIsrael, formatter),
-      'dafYomi': _buildDafYomiPayload(jewishCalendar),
-      'holidays': _buildHolidayPayloads(jewishCalendar, formatter),
-    };
-  }
-
-  /// דף היומי (בבלי) לתאריך העברי הנתון. `null` עבור תאריכים שקדמו לתחילת
-  /// המחזור הראשון (י"ח באלול תרפ"ג / 11.9.1923), שלגביהם הספרייה זורקת.
-  Map<String, dynamic>? _buildDafYomiPayload(JewishCalendar jewishCalendar) {
-    try {
-      final daf = jewishCalendar.getDafYomiBavli();
-      return {'masechet': daf.getMasechta(), 'daf': daf.getDaf()};
-    } on ArgumentError {
-      return null;
-    }
-  }
-
-  String _upcomingParasha(
-    DateTime date,
-    bool inIsrael,
-    HebrewDateFormatter formatter,
-  ) {
-    final dayOfWeek = date.weekday;
-    // Dart weekday: Mon=1 … Sat=6, Sun=7. Shabbat = Saturday = 6.
-    final daysUntilShabbat = dayOfWeek == 6 ? 0 : (6 - dayOfWeek) % 7;
-    final shabbatDate = addCalendarDays(date, daysUntilShabbat);
-    final shabbatCalendar = JewishCalendar.fromDateTime(shabbatDate)
-      ..inIsrael = inIsrael;
-    return formatter.formatParsha(shabbatCalendar);
-  }
-
-  List<Map<String, String>> _buildHolidayPayloads(
-    JewishCalendar jewishCalendar,
-    HebrewDateFormatter formatter,
-  ) {
-    final holidays = <Map<String, String>>[];
-    final seenLabels = <String>{};
-
-    void addHoliday(String label, String kind) {
-      final normalizedLabel = label.trim();
-      if (normalizedLabel.isEmpty || !seenLabels.add(normalizedLabel)) {
-        return;
-      }
-      holidays.add({'text': normalizedLabel, 'kind': kind});
-    }
-
-    final yomTovLabel = formatter.formatYomTov(jewishCalendar);
-    if (yomTovLabel.isNotEmpty) {
-      final month = jewishCalendar.getJewishMonth();
-      final day = jewishCalendar.getJewishDayOfMonth();
-      final idx = jewishCalendar.getYomTovIndex();
-
-      // לימים טובים של פסח יש שמות ספציפיים שהספרייה לא מבדילה ביניהם
-      if (idx == JewishCalendar.PESACH) {
-        if (month == 1 && day == 21) {
-          addHoliday('שביעי של פסח', 'yomTov');
-        } else if (month == 1 && day == 22) {
-          addHoliday('אחרון של פסח', 'yomTov');
-        } else if (month == 1 && day == 16) {
-          addHoliday('פסח שני', 'yomTov');
-        } else {
-          addHoliday(
-            yomTovLabel,
-            _holidayKindForLabel(yomTovLabel, jewishCalendar),
-          );
-        }
-      } else {
-        for (final label in yomTovLabel.split(',')) {
-          addHoliday(label, _holidayKindForLabel(label, jewishCalendar));
-        }
-      }
-    }
-
-    if (jewishCalendar.isErevRoshChodesh()) {
-      addHoliday(formatter.formatErevRoshChodesh(jewishCalendar), 'special');
-    }
-
-    if (jewishCalendar.isRoshChodesh()) {
-      addHoliday(formatter.formatRoshChodesh(jewishCalendar), 'roshChodesh');
-    }
-
-    return holidays;
-  }
-
-  String _holidayKindForLabel(String label, JewishCalendar jewishCalendar) {
-    final normalizedLabel = label.trim();
-    if (normalizedLabel.contains('ראש חודש') ||
-        normalizedLabel.contains('ר"ח')) {
-      return 'roshChodesh';
-    }
-
-    if (jewishCalendar.isTaanis() &&
-        jewishCalendar.getYomTovIndex() != JewishCalendar.YOM_KIPPUR) {
-      return 'taanit';
-    }
-
-    if (jewishCalendar.isYomTovAssurBemelacha()) {
-      return 'yomTov';
-    }
-
-    return 'special';
-  }
+  Map<String, dynamic> _buildJewishDatePayload(DateTime date, bool inIsrael) =>
+      PluginJewishDatePayloadBuilder.build(date, inIsrael: inIsrael);
 
   Future<List<String>> _getGrantedPermissions() async {
     return _pluginRepo.getGrantedPermissionNames(plugin.pluginId);
@@ -8281,6 +8211,23 @@ class PluginBridgeAdapter {
   ) async {
     switch (action) {
       case 'requestInstall':
+        if (args.containsKey('local')) {
+          if (!identical(args['local'], true) || args.length != 1) {
+            throw Exception('error.invalid_params: expected only local: true');
+          }
+          if (plugin.pluginId != PluginStoreLinkParser.storePluginId ||
+              plugin.isDevelopment) {
+            throw Exception('error.forbidden: store file picker unavailable');
+          }
+          final pickArchive = _dependencies.requestLocalPluginInstall;
+          if (pickArchive == null) {
+            throw Exception('error.unavailable: install not wired');
+          }
+          return pickArchive();
+        }
+        if (args['folderToken'] != null || args['path'] != null) {
+          throw Exception('error.invalid_params: file paths are unsupported');
+        }
         final url = args['url'] as String?;
         if (url == null) throw Exception('error.invalid_params: url required');
         final cb = _dependencies.requestPluginInstall;

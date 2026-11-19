@@ -5,11 +5,19 @@ import 'package:flutter/foundation.dart';
 import 'package:otzaria/data/sqlite/sqlite3_api.dart';
 import 'package:otzaria/core/app_paths.dart';
 import 'package:otzaria/plugins/models/installed_plugin.dart';
+import 'package:otzaria/plugins/models/plugin_manifest.dart';
 import 'package:otzaria/plugins/models/plugin_valid_permissions.dart';
 import 'package:otzaria/plugins/models/plugin_permission_grant.dart';
 import 'package:otzaria/plugins/models/plugin_published_record.dart';
 import 'package:otzaria/migration/database/sqlite3_utils.dart';
 import 'package:otzaria/plugins/storage/plugin_correction_draft_store.dart';
+
+/// מזהה שכבר משויך להתקנה או לנתונים שמורים של תוסף.
+class PluginInstallIdentityInUse implements Exception {
+  const PluginInstallIdentityInUse();
+}
+
+typedef _InstalledPluginSnapshot = (InstalledPlugin, Map<String, dynamic>);
 
 class PluginSystemDatabase {
   PluginSystemDatabase._();
@@ -178,8 +186,28 @@ class PluginSystemDatabase {
 
   // --- CRUD for Installed Plugins ---
 
+  // מוני החיבור מזהים שינויים מקומיים וכתיבות מחיבורי SQLite אחרים.
+  (Database, int, int, List<_InstalledPluginSnapshot>)? _installedPlugins;
+
   Future<List<InstalledPlugin>> getAllInstalledPlugins() async {
     final db = await database;
+    // total_changes כולל גם כתיבות שבסוף בוטלו.
+    final version = db.autocommit
+        ? db
+              .select(
+                'SELECT total_changes() AS c, data_version AS v '
+                'FROM pragma_data_version',
+              )
+              .single
+        : null;
+    if (_installedPlugins
+        case (final cachedDb, final changes, final dataVersion, final plugins)
+        when version != null &&
+            identical(cachedDb, db) &&
+            changes == version['c'] &&
+            dataVersion == version['v']) {
+      return _copyInstalledPlugins(plugins);
+    }
     final maps = db.select('''
       SELECT p.*,
         COALESCE((
@@ -192,8 +220,40 @@ class PluginSystemDatabase {
         ), 0) AS run_on_startup_granted
       FROM plugin_installation p
     ''').toMapList();
-    return maps.map((map) => InstalledPlugin.fromDbMap(map)).toList();
+    final plugins = maps.map(InstalledPlugin.fromDbMap).toList();
+    if (version == null) return plugins;
+
+    final snapshots = [
+      for (final plugin in plugins) (plugin, plugin.manifest.toJson()),
+    ];
+    _installedPlugins = (
+      db,
+      version['c'] as int,
+      version['v'] as int,
+      snapshots,
+    );
+    return _copyInstalledPlugins(snapshots);
   }
+
+  // רשימות ומפות במניפסט ניתנות לשינוי, גם בעומק התרומות הדקלרטיביות.
+  static List<InstalledPlugin> _copyInstalledPlugins(
+    List<_InstalledPluginSnapshot> plugins,
+  ) => [
+    for (final (plugin, manifest) in plugins)
+      plugin.copyWith(
+        manifest: PluginManifest.fromJson(
+          _copyJsonValue(manifest) as Map<String, dynamic>,
+        ),
+      ),
+  ];
+
+  static Object? _copyJsonValue(Object? value) => switch (value) {
+    Map<String, dynamic> map => map.map(
+      (key, child) => MapEntry(key, _copyJsonValue(child)),
+    ),
+    List<Object?> list => [for (final child in list) _copyJsonValue(child)],
+    _ => value,
+  };
 
   Future<bool> hasEnabledPlugin() async => readHasEnabledPlugin(await database);
 
@@ -221,6 +281,7 @@ class PluginSystemDatabase {
     Map<String, bool> permissions, {
     InstalledPlugin? expectedPlugin,
     Map<String, bool> expectedPermissions = const {},
+    bool requireNewInstallation = false,
   }) async {
     final db = await database;
     applyPluginInstall(
@@ -229,6 +290,7 @@ class PluginSystemDatabase {
       permissions,
       expectedPlugin: expectedPlugin,
       expectedPermissions: expectedPermissions,
+      requireNewInstallation: requireNewInstallation,
     );
   }
 
@@ -239,8 +301,27 @@ class PluginSystemDatabase {
     Map<String, bool> permissions, {
     InstalledPlugin? expectedPlugin,
     Map<String, bool> expectedPermissions = const {},
+    bool requireNewInstallation = false,
   }) {
     _inSavepoint(db, 'sp_plugin_install', () {
+      if (requireNewInstallation &&
+          db
+              .select(
+                '''
+            SELECT 1 FROM plugin_installation WHERE plugin_id = ?1
+            UNION ALL
+            SELECT 1 FROM plugin_permission_grant WHERE plugin_id = ?1
+            UNION ALL
+            SELECT 1 FROM plugin_kv_store WHERE plugin_id = ?1
+            UNION ALL
+            SELECT 1 FROM plugin_published_record WHERE plugin_id = ?1
+            LIMIT 1
+            ''',
+                [plugin.pluginId],
+              )
+              .isNotEmpty) {
+        throw const PluginInstallIdentityInUse();
+      }
       // הבדיקה והכתיבה באותה טרנזקציה: הסרה או החלטת משתמש מבטלות שדרוג אוטומטי.
       if (expectedPlugin != null) {
         final rows = db.select(
@@ -1029,6 +1110,7 @@ class PluginSystemDatabase {
     final db = _database;
     if (db != null) closeWithCheckpoint(db);
     _database = null;
+    _installedPlugins = null;
   }
 
   Future<void> lockForStorageMove(String requestId) async {
@@ -1073,6 +1155,7 @@ class PluginSystemDatabase {
     _pendingReads.clear();
     _database?.close();
     _database = null;
+    _installedPlugins = null;
     _opening = null;
     _storageMoveRequestId = null;
     _storageMoveReleased = null;

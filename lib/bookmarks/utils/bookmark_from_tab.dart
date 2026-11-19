@@ -17,11 +17,17 @@ Future<String> _lineRef(
   int index,
   Future<List<TocEntry>> Function() tableOfContents,
 ) async {
+  final heRef = await heRefFromDbLine(book, index);
+  final isLineNumber =
+      heRef != null &&
+      book.source.isOfficial &&
+      heRef == '${book.title} ${index + 1}';
   final ref =
-      await heRefFromDbLine(book, index) ??
+      (isLineNumber ? null : heRef) ??
       await refFromDbLine(book, index) ??
       await refFromIndex(index, tableOfContents());
-  return addBookTitleToRef(refUpToDaf(ref), book.title);
+  final location = addBookTitleToRef(refUpToDaf(ref), book.title);
+  return isLineNumber && location == book.title ? heRef : location;
 }
 
 /// בונה סימניה מטאב קריאה (טקסט/PDF/מפרשים) במיקומו הנוכחי.
@@ -185,7 +191,9 @@ OpenedTab tabFromBookmark(Bookmark bookmark, {double? screenWidth}) {
     bookmark.book,
     bookmark.index,
     initialReadingAnchor: bookmark.readingAnchor,
-    commentators: bookmark.commentatorsToShow,
+    commentators: bookmark.commentatorsToShow.isEmpty
+        ? null
+        : bookmark.commentatorsToShow,
     openLeftPane: openLeftPane,
   )..historySlot = bookmark.historySlot;
   restoreReadingTabNavigationHistory(tab, bookmark.navigationHistory);

@@ -689,9 +689,8 @@ class UserContentImporter {
     }
   }
 
-  /// קולט קובץ בפורמט ה-native (`<ספר>_links.json`): ספר הבסיס נגזר משם
-  /// הקובץ, שני הצדדים מאותרים לפי כותרת, ואינדקסי השורות
-  /// הגולמיים מאומתים מול totalLines של כל ספר — אין פתירת ref.
+  /// בקובץ native, שם הקובץ מזהה את ספר המקור ו-path_2 את ספר היעד.
+  /// אינדקסי השורות נבדקים מול totalLines של כל ספר.
   static Future<void> _ingestNativeLinks(
     ImportedFile file,
     List<UserLinkRecord> out,
@@ -713,37 +712,44 @@ class UserContentImporter {
       errors.add('$fileName ${err.message} (שורה ${err.lineNumber})');
     }
 
-    // אישי/רשמי קודמים; ספר שאין בהם נלקח מהמסד המצורף הגלוי הראשון שמכיל אותו.
+    // התאמה מדויקת קודמת לכתיב קרוב, גם אם היא במסד מצורף.
     Future<_LocatedLinkBook?> locate(String title) async {
       final found = await locateBook(title);
-      if (found != null) {
-        return (
-          isUserBook: found.isUserBook,
-          categoryId: found.categoryId,
-          totalLines: found.totalLines,
-          db: null,
-        );
+      if (found?.title != title) {
+        final inAttached = await attached.locate(title);
+        if (inAttached != null) {
+          return (
+            title: title,
+            isUserBook: false,
+            categoryId: null,
+            totalLines: inAttached.totalLines,
+            isDependentOnly: inAttached.isDependentOnly,
+            db: inAttached.slug,
+          );
+        }
+        if (found != null && await attached.hasLooseTitle(title)) {
+          throw AmbiguousUserLinkBookException(title, normalized: true);
+        }
       }
-      final inAttached = await attached.locate(title);
-      if (inAttached == null) return null;
+      if (found == null) return null;
       return (
-        isUserBook: false,
-        categoryId: null,
-        totalLines: inAttached.totalLines,
-        db: inAttached.slug,
+        title: found.title,
+        isUserBook: found.isUserBook,
+        categoryId: found.categoryId,
+        totalLines: found.totalLines,
+        isDependentOnly: found.isDependentOnly,
+        db: null,
       );
     }
 
     final _LocatedLinkBook? source;
     try {
       source = await locate(baseTitle);
-    } on AmbiguousUserLinkBookException {
-      errors.add(
-        '$fileName: ספר הבסיס "$baseTitle" קיים גם בספרייה האישית וגם ברשמית',
-      );
+    } on AmbiguousUserLinkBookException catch (e) {
+      errors.add('$fileName: ספר הבסיס "$baseTitle" ${e.details}');
       return;
-    } on UnavailableUserLinkCatalogException {
-      errors.add('$fileName: לא ניתן לבדוק את הספרייה הרשמית');
+    } on UnavailableUserLinkCatalogException catch (e) {
+      errors.add('$fileName: ${e.message}');
       return;
     }
     if (source == null) {
@@ -758,14 +764,12 @@ class UserContentImporter {
       if (!targetCache.containsKey(row.targetTitle)) {
         try {
           targetCache[row.targetTitle] = await locate(row.targetTitle);
-        } on AmbiguousUserLinkBookException {
+        } on AmbiguousUserLinkBookException catch (e) {
           ambiguousTargets.add(row.targetTitle);
-          errors.add(
-            '$fileName: ספר היעד "${row.targetTitle}" קיים גם בספרייה האישית וגם ברשמית',
-          );
+          errors.add('$fileName: ספר היעד "${row.targetTitle}" ${e.details}');
           continue;
-        } on UnavailableUserLinkCatalogException {
-          errors.add('$fileName: לא ניתן לבדוק את הספרייה הרשמית');
+        } on UnavailableUserLinkCatalogException catch (e) {
+          errors.add('$fileName: ${e.message}');
           return;
         }
       }
@@ -814,16 +818,17 @@ class UserContentImporter {
       final flip =
           LinkTypes.isDependentTextLink(connectionType) &&
           source.isUserBook &&
-          !target.isUserBook;
+          !target.isUserBook &&
+          !target.isDependentOnly;
       out.add(
         flip
             ? UserLinkRecord(
-                sourceTitle: row.targetTitle,
+                sourceTitle: target.title,
                 sourceCategoryId: target.categoryId,
                 sourceIsUserBook: target.isUserBook,
                 sourceDb: target.db,
                 sourceLineIndex: row.targetLineNumber - 1,
-                targetTitle: baseTitle,
+                targetTitle: source.title,
                 targetCategoryId: source.categoryId,
                 targetIsUserBook: source.isUserBook,
                 targetDb: source.db,
@@ -837,12 +842,12 @@ class UserContentImporter {
                 connectionType: connectionType,
               )
             : UserLinkRecord(
-                sourceTitle: baseTitle,
+                sourceTitle: source.title,
                 sourceCategoryId: source.categoryId,
                 sourceIsUserBook: source.isUserBook,
                 sourceDb: source.db,
                 sourceLineIndex: row.sourceLineNumber - 1,
-                targetTitle: row.targetTitle,
+                targetTitle: target.title,
                 targetCategoryId: target.categoryId,
                 targetIsUserBook: target.isUserBook,
                 targetDb: target.db,
@@ -952,9 +957,11 @@ class UserContentImporter {
 }
 
 typedef _LocatedLinkBook = ({
+  String title,
   bool isUserBook,
   int? categoryId,
   int totalLines,
+  bool isDependentOnly,
   String? db,
 });
 
