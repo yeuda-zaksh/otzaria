@@ -27,3 +27,6 @@ Review the fix branch adversarially per the lead maintainer: "the work must be c
 
 ## Maintainer context
 Maintainer Y-PLONI closed the large PR #5553 and asked for focused PRs with reproductions. His findings: (a) with nikud hidden, deleting first ב of `בַבֹ` keeps `בַ` (merge ignored the edit range); (b) Enter between voweled letters, delete second, undo → nikud lost (multi-line path loses source in undo history); (c) in a paragraph with a saved correction reopened for editing, Escape is swallowed; (d) highlight rescans ranges per segment on every build; (e) the getBookCorrectionStatus docs example must read `status` from the SDK response data envelope. Nikud hiding and search highlight are OUT of scope for the current PRs.
+
+## Quality bar (non-negotiable)
+The PR must meet Otzaria's highest standard. Before READY, check every item of `.github/pull_request_template.md` and AGENTS.md against the branch, and fill BODY.md following the template's structure exactly (all sections, including the visual-change section with each item answered or "אין"). Read the 5 most recently merged PRs touching the same area (`git log upstream/dev --merges -- <files>`) and match their style. Any doubt, shortcut, unguarded fix, unrelated change, or unexplained test difference → NOT READY.
