@@ -151,6 +151,81 @@ void main() {
     );
   });
 
+  group('פסקה מעוצבת שפוצלה בירידת שורה', () {
+    const source = 'אב<b>גד</b>ה';
+
+    /// האם כל תו בטקסט המצויר מודגש, לפי הסגנון שמגיע ל-EditableText.
+    List<bool> boldPerChar(WidgetTester tester) {
+      final field = editor(tester);
+      final span = field.controller.buildTextSpan(
+        context: tester.element(find.byType(EditableText)),
+        style: field.style,
+        withComposing: false,
+      );
+      final flags = <bool>[];
+      void walk(InlineSpan node, bool inherited) {
+        if (node is! TextSpan) return;
+        final bold = node.style?.fontWeight == FontWeight.bold || inherited;
+        for (final unit in (node.text ?? '').codeUnits) {
+          if (unit != 0x0D) flags.add(bold);
+        }
+        node.children?.forEach((child) => walk(child, bold));
+      }
+
+      walk(span, false);
+      return flags;
+    }
+
+    testWidgets('העיצוב מוצג גם אחרי ירידת השורה', (tester) async {
+      final service = await begin(tester, [source]);
+      await tester.pumpWidget(paragraphs(service, [source]));
+      await openFirst(tester);
+      await type(tester, 'אב\nגדה', 3);
+      expect(boldPerChar(tester), [false, false, false, true, true, false]);
+      await finish(tester, service);
+    });
+
+    testWidgets('ביטול וביצוע חוזר אחרי מחיקת תו מודגש מחזירים את העיצוב', (
+      tester,
+    ) async {
+      final service = await begin(tester, [source]);
+      await tester.pumpWidget(paragraphs(service, [source]));
+      await openFirst(tester);
+      await type(tester, 'אב\nגדה', 3);
+      await type(tester, 'אב\nדה', 3);
+      Future<void> undoOrRedo({bool redo = false}) async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        if (redo) await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+        if (redo) await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+      }
+
+      await undoOrRedo();
+      expect(clean(tester).text, 'אב\nגדה');
+      expect(clean(tester).formats.map((f) => f.bold), [
+        false,
+        false,
+        false,
+        true,
+        true,
+        false,
+      ]);
+      expect(boldPerChar(tester), [false, false, false, true, true, false]);
+      await undoOrRedo(redo: true);
+      expect(clean(tester).text, 'אב\nדה');
+      expect(clean(tester).formats.map((f) => f.bold), [
+        false,
+        false,
+        false,
+        true,
+        false,
+      ]);
+      await finish(tester, service);
+    });
+  });
+
   group('חצים', () {
     testWidgets('חץ מטה ומעלה עוברים בין פסקאות ושומרים את העמודה', (
       tester,
