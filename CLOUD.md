@@ -30,3 +30,12 @@ Maintainer Y-PLONI closed the large PR #5553 and asked for focused PRs with repr
 
 ## Quality bar (non-negotiable)
 The PR must meet Otzaria's highest standard. Before READY, check every item of `.github/pull_request_template.md` and AGENTS.md against the branch, and fill BODY.md following the template's structure exactly (all sections, including the visual-change section with each item answered or "אין"). Read the 5 most recently merged PRs touching the same area (`git log upstream/dev --merges -- <files>`) and match their style. Any doubt, shortcut, unguarded fix, unrelated change, or unexplained test difference → NOT READY.
+
+## Loop mode (role: loop) — deliver a finished PR
+You own the slug end-to-end in this one session. Repeat up to 4 rounds:
+1. FIX: apply the fix role to the branch (round 1: the notes; later rounds: the QA findings).
+2. QA: launch a SEPARATE subagent (Agent tool, fresh context) with only: CLOUD.md path, notes/<slug>.md, the branch name, and "act as the QA role; return READY/NOT READY + findings". Never give it your reasoning or conclusions. Do not review your own work.
+3. If QA returns READY → stop. If NOT READY → fix exactly its findings and go to 1.
+Owner-waived items are not findings: screenshots, Fixes# (use "Refs #5553").
+Stop early with NOT READY only for a decision that belongs to a maintainer/owner, with evidence.
+At the end push the branch (2 commits, --force-with-lease) and prbody/<slug>-final (VERDICT.md first line READY/NOT READY, the round history, final test counts branch vs base; BODY.md final). The manager will only verify and submit.
