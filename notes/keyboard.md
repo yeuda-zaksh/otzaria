@@ -6,3 +6,6 @@ REMAINING (must fix in this PR — reachable only because Enter now works):
 Partial unfinished attempt at these is on branch wip/keyboard-format-undo (reference only, do not merge as-is).
 Also verify maintainer repro (b) on this branch (no nikud hiding here): Enter between `בַבֹ`, delete second, undo → nikud intact.
 Tests for both fixes, red without fix. Keep exactly 2 commits. PR title: "העורך בתוסף התיקון: Enter מכניס ירידת שורה, חצים נעים בין שורות ופסקאות, Escape יוצא מהעריכה". Overlaps: #5551 (plugin_book_correction_service.dart). Refs #5553.
+
+## QA round (manager)
+Fix round result: branch fac89b956 (2 commits over 7f2b6c4ec), +1468 vs dev +1450, mutations proven for format expand and undo copyWith. Owner decisions: no screenshots required, no issue — use "Refs #5553". The combined_book_screen_test expectation update belongs in commit 2 (behavior change) — verify it only changes the '\n' expectation and keeps tag rejection coverage. Read recent merged PRs via `git log upstream/dev --merges -- lib/widgets/text lib/plugins/view` for style.
