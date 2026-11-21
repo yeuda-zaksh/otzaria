@@ -9,3 +9,6 @@ Reference (has the bugs above, use only for ideas): branch fix/correction-editor
 Out of scope: search highlight (separate later PR), keyboard, no-jump.
 Overlaps to check: #5683, #5682 and the fork branch fix/correction-editor-no-jump (not yet a PR) — report conflicts and keep them minimal.
 PR title suggestion: "עורך התיקון: הסתרת ניקוד וטעמים כמו בתצוגה, בלי לאבד את המקור". Refs #5553.
+
+## Update (manager)
+#5683 is now merged into upstream/dev — Enter works on dev, so repro (b) must be a regular test on your branch (red without your fix).
