@@ -1,0 +1,11 @@
+# nikud — new branch fix/correction-editor-hide-nikud from newest upstream/dev (role: loop)
+Goal: in the plugin correction editor, hide exactly what the reading view hides (RenderSettings removeNikud / removeTeamim via utils.removeMarks — single source of truth, no own regex lists; maqaf shown as space and paseq rules exactly as the reader), while edits merge back into the FULL source losslessly.
+Required model (maintainer Y-PLONI on closed #5553): keep the EDIT RANGE and the full source along the entire input and undo path. Never reconstruct by common prefix/suffix. Concretely: derive the edited range from the TextEditingValue change (old selection/composing + new value), map visible offsets ↔ source offsets through a projection, splice only that source range; undo/redo history entries must carry the full source (integrate with #5244's _FormattedEditingValue; also the hard-break/multi-line path in lib/widgets/text/rtl_text_field.dart + rtl_hard_break_workaround.dart).
+Must-pass reproductions (tests red on dev or on a naive implementation, green on yours):
+ (a) nikud hidden, source `בַבֹ`, delete the FIRST ב → source `בֹ` (not `בַ`).
+ (b) Enter between two voweled letters, delete the second, undo → nikud restored. NOTE: Enter is enabled only by open PR #5683 (branch fix/correction-editor-keyboard in this fork). Write (b) as a test that applies on top of #5683; if it can't run on dev, include it in BODY as a follow-up and test it locally on a temp merge of #5683 + your branch, reporting the result.
+ Also: delete-then-undo `שָׁלוֹם עוֹלָם` (delete ו), all 4 flag combos on `בְּרֵאשִׁ֖ית בָּרָ֣א אֱלֹהִ֑ים אֵ֣ת־הַשָּׁמַ֔יִם` (editor text == reader plain text; untouched round trip == source), paseq `אב ׀ גד`, draft restore, toggling flags while open, #5244 formats aligned to the visible text.
+Reference (has the bugs above, use only for ideas): branch fix/correction-editor-usability, files lib/plugins/view/plugin_correction_controller.dart and plugin_correction_paragraph.dart.
+Out of scope: search highlight (separate later PR), keyboard, no-jump.
+Overlaps to check: #5683, #5682 and the fork branch fix/correction-editor-no-jump (not yet a PR) — report conflicts and keep them minimal.
+PR title suggestion: "עורך התיקון: הסתרת ניקוד וטעמים כמו בתצוגה, בלי לאבד את המקור". Refs #5553.
