@@ -20,3 +20,9 @@ The previous loop's code is fine; close ONLY these findings from prbody/highligh
 6. BODY.md: the screenshot line must be exactly `- [ ] שינוי UI? — לא צורפו צילומי מסך` (owner waived; no [x]). Keep Refs #5553.
 Merge order with #5739/#5667 is a maintainer matter, not a finding: mention in BODY risks only (#5667 may need the "current match" test's background expectation updated if it merges first).
 Then a fresh QA subagent; loop up to 2 rounds; write prbody/highlight-final.
+
+## Round 6 — PR #5776 is open (manager; owner approved the force push on 2026-11-22)
+PR #5776 exists (draft, CI red). Two causes:
+- CI "Analyze" failed on `generate_plugin_spec --check` ("FindRefPreferenceStore.scoresKey"), a dev breakage between c83dbb5cd and its dev fix 7d71205f5, not our code. A new push re-runs CI on current dev.
+- Maintainer Y-PLONI pushed 0b75bc68b ("מיפוי קלט ושחזור ניקוד מוסתר בביטול") onto the base branch fix/correction-editor-hide-nikud (PR #5735). Our 2 commits now CONFLICT with it in lib/plugins/view/plugin_correction_controller.dart.
+Task: rebase the 2 highlight commits onto the NEW origin/fix/correction-editor-hide-nikud (0b75bc68b). Keep the maintainer's code and behavior intact; adapt ours to it. Keep exactly 2 commits of ours on top. Run the highlight test file + all files importing the controller/paragraph, branch vs base (0b75bc68b); analyze/format/ui_lint/spec --check. Also run `dart run tool/plugins/generate_plugin_spec.dart --check` on a temporary merge of the branch with current upstream/dev, so CI Analyze will pass. Fresh QA subagent. The owner approved `git push --force-with-lease` to fix/correction-editor-search-highlight for this rebase only. Update BODY: the base commits shown in the PR are now dad6e119d, e3faf9d17, 0b75bc68b. Write prbody/highlight-final.
