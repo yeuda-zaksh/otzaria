@@ -6,3 +6,6 @@ Maintainer finding (d) on closed #5553: the previous implementation rescanned hi
 Tests (red on base branch): voweled text + unvoweled query highlights same ranges as reader (nikud shown and hidden), edited text highlighted, current match styling, alternative words, composing (IME) keeps underline, highlight in a paragraph split by Enter (hard-break path), revision change re-highlights.
 Reference (has the perf issue, ideas only): branch fix/correction-editor-usability — coloredRanges/_highlightsFor in plugin_correction_controller.dart / plugin_correction_paragraph.dart.
 PR title suggestion: "עורך התיקון: הדגשת תוצאות חיפוש כמו בתצוגה". Refs #5553.
+
+## Resume (manager)
+Previous loop run stopped on a spend limit after pushing round-1 commits (fix/correction-editor-search-highlight @ 89b3894a9: test commit e4beeb038 + fix). QA never finished. Do NOT redo the fix: start at step 2 (fresh QA subagent) on the pushed branch, then continue the loop as usual and write prbody/highlight-final.
