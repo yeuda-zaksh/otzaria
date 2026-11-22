@@ -378,6 +378,7 @@ class _PluginCorrectionParagraphState extends State<PluginCorrectionParagraph> {
       teamim: widget.settings.removeTeamim,
     );
     controller.formatParentheses = widget.settings.formatParentheses;
+    controller.setHighlight(widget.settings);
     controller.setSource(widget.sourceText);
     final canonical = _registry.editableText(
       widget.tabId,

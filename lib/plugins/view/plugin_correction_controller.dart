@@ -3,12 +3,19 @@ import 'package:otzaria/plugins/services/plugin_correction_text.dart';
 import 'package:otzaria/plugins/view/plugin_correction_edit.dart';
 import 'package:otzaria/plugins/view/plugin_correction_projection.dart';
 import 'package:otzaria/theme/app_fonts.dart';
+import 'package:otzaria/theme/search_highlight_css.dart';
+import 'package:otzaria/utils/text/text_manipulation.dart' as utils;
+import 'package:otzaria/widgets/smart_text/render_settings.dart';
 import 'package:otzaria/widgets/smart_text/simple_inline_html.dart';
+import 'package:otzaria/widgets/smart_text/text_renderer_service.dart';
 
 export 'package:otzaria/plugins/view/plugin_correction_edit.dart'
     show CorrectionFormat;
 
 typedef CorrectionUndoValue = ({String canonical, TextEditingValue editing});
+
+/// טווח בטקסט שבעורך שהקורא היה מדגיש, ואינדקס הסגנון שלו ב-`styles`.
+typedef _HighlightRange = ({int start, int end, int style});
 
 /// בקר העורך: מסתיר את רווחי תגיות הבלוק בקצוות ואת מה שהקורא מסתיר, ומציג את
 /// עיצוב המקור. כל עריכה ממוזגת אל הטקסט המלא לפי הטווח שנערך.
@@ -30,6 +37,12 @@ class PluginCorrectionController extends TextEditingController {
   ({EditorState state, TextEditingValue value})? _composition;
   final VoidCallback? onEdit;
   ValueNotifier<CorrectionUndoValue>? _undoValue;
+  RenderSettings? _search;
+  ({String text, RenderSettings search, int revision})? _highlightKey;
+  List<_HighlightRange> _highlightRanges = const [];
+  List<String> _highlightCss = const [];
+  ColorScheme? _highlightScheme;
+  List<TextStyle> _highlightStyles = const [];
 
   /// כמו בקריאה: טקסט שבין סוגריים מוצג מוקטן (`RenderSettings.formatParentheses`).
   bool formatParentheses = true;
@@ -78,6 +91,7 @@ class PluginCorrectionController extends TextEditingController {
 
   @override
   void dispose() {
+    utils.highlightPatternRevision.removeListener(_onPatternRevision);
     undoValue.dispose();
     super.dispose();
   }
@@ -91,6 +105,102 @@ class PluginCorrectionController extends TextEditingController {
     _pending = null;
     _composition = null;
     _showState(_state.withHiding(nikud: nikud, teamim: teamim), value);
+  }
+
+  /// מגדיר את חיפוש הקורא להדגשה; null כשאין חיפוש.
+  void setHighlight(RenderSettings settings) {
+    final next = settings.searchText.isEmpty
+        ? null
+        : settings.copyWith(
+            removePunctuation: false,
+            replaceHolyNames: false,
+            formatParentheses: false,
+          );
+    if (next == _search) return;
+    if (_search == null) {
+      utils.highlightPatternRevision.addListener(_onPatternRevision);
+    } else if (next == null) {
+      utils.highlightPatternRevision.removeListener(_onPatternRevision);
+    }
+    _search = next;
+  }
+
+  void _onPatternRevision() => notifyListeners();
+
+  /// ההדגשה של הקורא לטקסט הנוכחי, מחושבת מחדש רק כשהטקסט, ההגדרות או
+  /// תבנית ההדגשה משתנים.
+  List<_HighlightRange> _highlights() {
+    final search = _search;
+    if (search == null || text.isEmpty) return const [];
+    final key = (
+      text: text,
+      search: search,
+      revision: utils.highlightPatternRevision.value,
+    );
+    if (key != _highlightKey) {
+      _highlightKey = key;
+      _scanHighlights(search);
+    }
+    return _highlightRanges;
+  }
+
+  static final _highlightSpan = RegExp(r'<span style="([^"]*)">([^<]*)</span>');
+
+  /// מריץ את צינור הקורא וקורא את הטווחים המודגשים מה-HTML שלו.
+  void _scanHighlights(RenderSettings settings) {
+    final html = TextRendererService.processText(text, settings);
+    final styleIds = <String, int>{};
+    final ranges = <_HighlightRange>[];
+    var position = 0;
+    var plainLength = 0;
+    for (final match in _highlightSpan.allMatches(html)) {
+      plainLength += match.start - position;
+      final start = plainLength;
+      plainLength += match[2]!.length;
+      ranges.add((
+        start: start,
+        end: plainLength,
+        style: styleIds.putIfAbsent(match[1]!, () => styleIds.length),
+      ));
+      position = match.end;
+    }
+    _highlightRanges = ranges;
+    _highlightCss = styleIds.keys.toList();
+    _highlightScheme = null;
+  }
+
+  List<TextStyle> _highlightStylesFor(ColorScheme scheme) {
+    if (_highlightScheme != scheme) {
+      _highlightScheme = scheme;
+      _highlightStyles = [
+        for (final css in _highlightCss)
+          _cssTextStyle(SearchHighlightCss.resolve(css, scheme)),
+      ];
+    }
+    return _highlightStyles;
+  }
+
+  /// `color` ו-`background-color` מ-CSS שבו כל הצבעים כבר `#rrggbbaa`.
+  static TextStyle _cssTextStyle(String css) {
+    Color? color;
+    Color? background;
+    for (final declaration in css.split(';')) {
+      final colon = declaration.indexOf(':');
+      if (colon < 0) continue;
+      final value = int.tryParse(
+        declaration.substring(colon + 1).trim().substring(1),
+        radix: 16,
+      );
+      if (value == null) continue;
+      final parsed = Color(((value & 0xFF) << 24) | (value >>> 8));
+      switch (declaration.substring(0, colon).trim()) {
+        case 'color':
+          color = parsed;
+        case 'background-color':
+          background = parsed;
+      }
+    }
+    return TextStyle(color: color, backgroundColor: background);
   }
 
   /// עיצוב כל יחידת UTF-16 בטקסט שבעורך.
@@ -276,11 +386,13 @@ class PluginCorrectionController extends TextEditingController {
   }) {
     final parenthesized = formatParentheses ? _parenthesized(text) : null;
     final visibleFormats = _state.visibleFormats;
+    final formats = visibleFormats.length == text.length
+        ? visibleFormats
+        : List.filled(text.length, plainCorrectionFormat);
+    final highlights = _highlights();
     if (parenthesized == null &&
-        (visibleFormats.length != text.length ||
-            visibleFormats.every(
-              (format) => format == plainCorrectionFormat,
-            ))) {
+        highlights.isEmpty &&
+        formats.every((format) => format == plainCorrectionFormat)) {
       return super.buildTextSpan(
         context: context,
         style: style,
@@ -291,18 +403,29 @@ class PluginCorrectionController extends TextEditingController {
         ? value.composing
         : TextRange.empty;
     final base = style ?? const TextStyle();
-    final linkColor = Theme.of(context).colorScheme.primary;
-    final formats = visibleFormats.length == text.length
-        ? visibleFormats
-        : List.filled(text.length, plainCorrectionFormat);
+    final scheme = Theme.of(context).colorScheme;
+    final linkColor = scheme.primary;
+    final highlightStyles = highlights.isEmpty
+        ? const <TextStyle>[]
+        : _highlightStylesFor(scheme);
     final children = <TextSpan>[];
     var start = 0;
+    var next = 0;
     while (start < text.length) {
       final format = formats[start];
       final small = parenthesized?[start] ?? false;
       final inComposing = start >= composing.start && start < composing.end;
+      while (next < highlights.length && highlights[next].end <= start) {
+        next++;
+      }
+      final active = next < highlights.length && highlights[next].start <= start
+          ? highlights[next]
+          : null;
+      final limit =
+          active?.end ??
+          (next < highlights.length ? highlights[next].start : text.length);
       var end = start + 1;
-      while (end < text.length &&
+      while (end < limit &&
           formats[end] == format &&
           (parenthesized?[end] ?? false) == small &&
           end != composing.start &&
@@ -312,7 +435,14 @@ class PluginCorrectionController extends TextEditingController {
       children.add(
         TextSpan(
           text: text.substring(start, end),
-          style: _resolve(format, base, linkColor, inComposing, small),
+          style: _resolve(
+            format,
+            base,
+            linkColor,
+            inComposing,
+            small,
+            active == null ? null : highlightStyles[active.style],
+          ),
         ),
       );
       start = end;
@@ -326,8 +456,12 @@ class PluginCorrectionController extends TextEditingController {
     Color linkColor,
     bool composing,
     bool parenthesized,
+    TextStyle? highlight,
   ) {
-    if (format == plainCorrectionFormat && !composing && !parenthesized) {
+    if (format == plainCorrectionFormat &&
+        !composing &&
+        !parenthesized &&
+        highlight == null) {
       return null;
     }
     var style = base;
@@ -363,7 +497,7 @@ class PluginCorrectionController extends TextEditingController {
             : TextDecoration.combine(decorations),
       );
     }
-    return style;
+    return highlight == null ? style : style.merge(highlight);
   }
 
   /// תווים בתוך זוג סוגריים סמוך, באותו כלל של `formatTextWithParentheses`;
